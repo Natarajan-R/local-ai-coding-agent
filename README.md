@@ -8,6 +8,32 @@ and reflects on failures — all driven by a local model served by
 > **New here? Start with the [User Guide](USER_GUIDE.md)** — install, first run,
 > commands, recipes, the web UI, and troubleshooting.
 
+---
+
+## 📖 Companion to the book
+
+<img src="docs/cover.png" alt="Building a Local AI Coding Agent — book cover" align="right" width="240">
+
+This repository is the companion code for **_Building a Local AI Coding Agent — A
+Hands-On Guide to Building Autonomous, Offline Coding Agents_** by Natarajan Ramasamy.
+
+Tools like Cursor, Aider, and Claude Code feel like magic. They are not — a coding
+agent is an *architecture* you can build yourself. The book explains this entire
+codebase from first principles, one file at a time: the FSM control loop, the
+subprocess/Docker sandbox and command guardrails, tree-sitter + LSP perception, a
+SQLite symbol graph, the token-budget / memory / reflexion reliability layer, and a
+streaming web dashboard + CLI. Everything runs **offline on your own machine** — no
+cloud API, no keys, no per-token cost.
+
+If you want to understand *why* every line here is the way it is, the book is the
+guided tour of this repo.
+
+*Available on Amazon Kindle — link coming soon.*
+
+<br clear="right"/>
+
+---
+
 - [Features](#features)
 - [Requirements](#requirements)
 - [Setup](#setup-virtualenv--pip)
