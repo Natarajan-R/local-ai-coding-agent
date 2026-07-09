@@ -1,0 +1,8 @@
+# Development dependencies (tests + linting). Installs runtime deps too.
+-r requirements.txt
+pytest>=8.0
+pytest-asyncio>=0.23
+ruff>=0.4
+python-lsp-server>=1.9
+aiohttp>=3.9
+bashlex>=0.18

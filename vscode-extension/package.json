@@ -1,0 +1,53 @@
+{
+  "name": "ai-coding-agent",
+  "displayName": "AI Coding Agent",
+  "description": "Drive the local AI Coding Agent from VS Code: live run dashboard with native command-approval and hint prompts.",
+  "version": "0.1.0",
+  "publisher": "ai-coding-agent",
+  "license": "MIT",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "aiAgent.openDashboard",
+        "title": "AI Agent: Open Dashboard"
+      },
+      {
+        "command": "aiAgent.runTask",
+        "title": "AI Agent: Run Task…"
+      }
+    ],
+    "configuration": {
+      "title": "AI Coding Agent",
+      "properties": {
+        "aiAgent.serverUrl": {
+          "type": "string",
+          "default": "ws://127.0.0.1:8765",
+          "description": "URL of a running `ai-agent serve` instance."
+        },
+        "aiAgent.autoApprove": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run in --auto mode (skip command-approval prompts)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.4.0"
+  }
+}

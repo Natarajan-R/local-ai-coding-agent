@@ -1,0 +1,38 @@
+# Runtime dependencies for the AI coding agent.
+# Install into a virtual environment:
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+typer>=0.12
+rich>=13.7
+httpx>=0.27
+docker>=7.0
+pydantic>=2.7
+
+# Tree-sitter multi-language symbol extraction (optional at runtime: the agent
+# degrades to regex/AST profiles if these are absent). Each grammar wheel bundles
+# its compiled parser, so no network access is needed at runtime.
+tree-sitter>=0.21
+tree-sitter-python>=0.21
+tree-sitter-java>=0.21
+tree-sitter-javascript>=0.21
+tree-sitter-typescript>=0.21
+tree-sitter-go>=0.21
+tree-sitter-bash>=0.21
+tree-sitter-powershell>=0.24
+tree-sitter-c-sharp>=0.21
+tree-sitter-rust>=0.21
+tree-sitter-ruby>=0.21
+tree-sitter-c>=0.21
+tree-sitter-cpp>=0.21
+
+# Optional: local Language Server for semantic navigation (find_definition,
+# find_references, live diagnostics). The agent runs fine without it -- LSP
+# tools are only registered when a server is reachable.
+python-lsp-server>=1.9
+
+# Optional: the `ai-agent serve` web dashboard. Not needed for the CLI.
+aiohttp>=3.9
+
+# Optional: AST-based command guardrail (resists quote/pipe obfuscation).
+# Falls back to the regex guard if absent.
+bashlex>=0.18
