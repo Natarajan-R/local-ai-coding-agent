@@ -28,7 +28,7 @@ cloud API, no keys, no per-token cost.
 If you want to understand *why* every line here is the way it is, the book is the
 guided tour of this repo.
 
-*Available on Amazon Kindle — link coming soon.*
+📖 **Get it on Amazon Kindle:** [US](https://www.amazon.com/dp/B0H8B6QXXX) · [India](https://www.amazon.in/dp/B0H8B6QXXX)
 
 <br clear="right"/>
 
