@@ -220,6 +220,24 @@ def _docker_available() -> bool:
         return False
 
 
+def _docker_image_present(image: str) -> bool:
+    """True only if ``image`` is already built locally.
+
+    A reachable daemon is not enough — Docker is only *usable* if the sandbox
+    image actually exists, otherwise starting a container fails with a pull
+    error. ``auto`` uses this to avoid selecting a backend that cannot run.
+    """
+    try:
+        import docker
+    except ImportError:
+        return False
+    try:  # pragma: no cover - depends on daemon
+        docker.from_env().images.get(image)
+        return True
+    except Exception:
+        return False
+
+
 class SandboxManager:
     """Facade that selects and delegates to a sandbox backend."""
 
@@ -237,8 +255,15 @@ class SandboxManager:
             return DockerSandbox(config)
         # auto
         if _docker_available():
-            logger.info("Sandbox backend: docker")
-            return DockerSandbox(config)
+            if _docker_image_present(config.image):
+                logger.info("Sandbox backend: docker")
+                return DockerSandbox(config)
+            logger.warning(
+                "Sandbox backend: local — Docker is running but image %r is not "
+                "built. Run `ai-agent build-sandbox` for container isolation.",
+                config.image,
+            )
+            return LocalSandbox(config)
         logger.info("Sandbox backend: local (docker unavailable)")
         return LocalSandbox(config)
 
