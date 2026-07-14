@@ -251,7 +251,9 @@ Drive the agent from inside VS Code, with **native Approve/Deny and hint dialogs
    npm run compile
    ```
 3. Open the `vscode-extension` folder in VS Code and press **F5** to launch an
-   Extension Development Host.
+   Extension Development Host. (The folder ships a `.vscode/launch.json`, so F5 works
+   directly — no debug config to create. If you edit `src/extension.ts`, re-run
+   `npm run compile` before pressing F5 again, since it runs the compiled `out/`.)
 4. Paste the token into **Settings → `aiAgent.token`** (the `serve` process gates the
    WebSocket with it; without it the extension is rejected with a 403). The token
    changes each time you restart `serve`.

@@ -28,7 +28,9 @@ npm run compile
 ```
 
 Then press **F5** in VS Code (with this folder open) to launch an Extension
-Development Host. In it:
+Development Host — this folder ships a `.vscode/launch.json`, so F5 works with no
+extra setup. (Re-run `npm run compile` after editing `src/`, since F5 runs `out/`.)
+In it:
 
 - **AI Agent: Open Dashboard** — opens the live run viewer.
 - **AI Agent: Run Task…** — prompts for a task and starts a run.
