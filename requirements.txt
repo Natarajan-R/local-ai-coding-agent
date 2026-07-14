@@ -28,7 +28,7 @@ tree-sitter-cpp>=0.21
 # Optional: local Language Server for semantic navigation (find_definition,
 # find_references, live diagnostics). The agent runs fine without it -- LSP
 # tools are only registered when a server is reachable.
-python-lsp-server>=1.9
+python-lsp-server[pyflakes,pycodestyle]>=1.9
 
 # Optional: the `ai-agent serve` web dashboard. Not needed for the CLI.
 aiohttp>=3.9

@@ -24,7 +24,7 @@ security = [
     "bashlex>=0.18",
 ]
 lsp = [
-    "python-lsp-server>=1.9",
+    "python-lsp-server[pyflakes,pycodestyle]>=1.9",
 ]
 treesitter = [
     "tree-sitter>=0.21",
@@ -58,7 +58,7 @@ dev = [
     "tree-sitter-ruby>=0.21",
     "tree-sitter-c>=0.21",
     "tree-sitter-cpp>=0.21",
-    "python-lsp-server>=1.9",
+    "python-lsp-server[pyflakes,pycodestyle]>=1.9",
     "aiohttp>=3.9",
     "bashlex>=0.18",
 ]
