@@ -29,7 +29,11 @@ function config<T>(key: string, fallback: T): T {
 }
 
 function wsUrl(): string {
-  return config<string>("serverUrl", "ws://127.0.0.1:8765").replace(/\/+$/, "") + "/ws";
+  const base = config<string>("serverUrl", "ws://127.0.0.1:8765").replace(/\/+$/, "");
+  // `ai-agent serve` gates /ws with a per-session token by default; present it if
+  // configured. Leave `aiAgent.token` blank only when the server runs with --no-auth.
+  const token = config<string>("token", "").trim();
+  return base + "/ws" + (token ? "?token=" + encodeURIComponent(token) : "");
 }
 
 function toWebview(msg: unknown): void {

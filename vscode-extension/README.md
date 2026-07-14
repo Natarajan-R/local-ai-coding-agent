@@ -41,6 +41,7 @@ When it exhausts its retries, VS Code shows an **input box** to type a hint.
 | Setting | Default | Description |
 | --- | --- | --- |
 | `aiAgent.serverUrl` | `ws://127.0.0.1:8765` | URL of the `ai-agent serve` instance |
+| `aiAgent.token` | `""` | Session token printed by `ai-agent serve` (the `?token=…` value). Required unless the server runs with `--no-auth`; without it the WebSocket is rejected with a 403. |
 | `aiAgent.autoApprove` | `false` | Run in `--auto` mode (skip approval prompts) |
 
 ## Notes

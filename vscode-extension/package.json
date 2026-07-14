@@ -28,6 +28,11 @@
           "default": "ws://127.0.0.1:8765",
           "description": "URL of a running `ai-agent serve` instance."
         },
+        "aiAgent.token": {
+          "type": "string",
+          "default": "",
+          "description": "Session token printed by `ai-agent serve` (the ?token=… value). Required unless the server runs with --no-auth."
+        },
         "aiAgent.autoApprove": {
           "type": "boolean",
           "default": false,

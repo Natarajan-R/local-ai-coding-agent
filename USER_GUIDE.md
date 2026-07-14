@@ -242,7 +242,8 @@ get a **hint box**.
 
 Drive the agent from inside VS Code, with **native Approve/Deny and hint dialogs**.
 
-1. Start the server: `ai-agent serve --workspace .`
+1. Start the server: `ai-agent serve --workspace .` — it prints a URL with a
+   per-session token, e.g. `http://127.0.0.1:8765/?token=ab12…`. **Copy that token.**
 2. Build the extension:
    ```bash
    cd vscode-extension
@@ -251,9 +252,17 @@ Drive the agent from inside VS Code, with **native Approve/Deny and hint dialogs
    ```
 3. Open the `vscode-extension` folder in VS Code and press **F5** to launch an
    Extension Development Host.
-4. Use the command palette: **AI Agent: Open Dashboard** or **AI Agent: Run Task…**
+4. Paste the token into **Settings → `aiAgent.token`** (the `serve` process gates the
+   WebSocket with it; without it the extension is rejected with a 403). The token
+   changes each time you restart `serve`.
+5. Use the command palette: **AI Agent: Open Dashboard** or **AI Agent: Run Task…**
 
-Settings: `aiAgent.serverUrl` (default `ws://127.0.0.1:8765`) and
+> **Quick local demo?** Run `ai-agent serve --no-auth --workspace .` and leave
+> `aiAgent.token` blank. The server allows `--no-auth` only on a loopback address
+> (`127.0.0.1`), so nothing off-machine can reach it — fine for a local demo, but
+> keep the token for anything shared.
+
+Settings: `aiAgent.serverUrl` (default `ws://127.0.0.1:8765`), `aiAgent.token`, and
 `aiAgent.autoApprove`. See [vscode-extension/README.md](vscode-extension/README.md).
 
 ---
