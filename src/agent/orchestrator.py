@@ -299,18 +299,22 @@ class Orchestrator:
             console.print(f"[bold cyan]→ {call.name}[/bold cyan] {list(call.arguments)}")
             self.emit("tool_call", step=step, tool=call.name, args=call.arguments)
             result = await self.tools.execute(call.name, call.arguments)
-            console.print(f"[dim]{result.content[:500]}[/dim]")
+            # Redact secrets once, at the boundary — before the output reaches the
+            # console, the model's context, or the dashboard. Any tool's output
+            # (read_file, search, …) is covered here, not just run_command.
+            safe_content = self.policy.scrub(result.content)
+            console.print(f"[dim]{safe_content[:500]}[/dim]")
             self.log.info("step %d: %s ok=%s", step, call.name, result.ok)
             self._audit(
                 "tool_call", step=step, tool=call.name,
                 args=list(call.arguments), ok=result.ok,
             )
             self.emit("tool_result", step=step, tool=call.name, ok=result.ok,
-                      content=self.policy.scrub(result.content))
+                      content=safe_content)
 
             self.frame.messages.append({
                 "role": "tool",
-                "content": result.content,
+                "content": safe_content,
                 "name": call.name,
             })
 
