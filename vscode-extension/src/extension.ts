@@ -206,7 +206,10 @@ function getHtml(webview: vscode.Webview): string {
       case 'approval_required': card('', 'approval (answer in the VS Code prompt)', e.detail); break;
       case 'escalation_required': card('', 'stuck — hint requested (see prompt)', e.context); break;
       case 'run_finished': statusEl.textContent='Finished: ' + e.final_state;
-        card(e.final_state==='done'?'ok':'fail', 'summary', e.summary || ''); break;
+        card(e.final_state==='done'?'ok':'fail', 'summary', e.summary || '');
+        if (e.stats) card('', 'telemetry', e.stats.model_calls + ' model calls · '
+          + e.stats.total_tokens + ' tokens · ' + (e.stats.total_seconds||0).toFixed(1)
+          + 's · $0.00'); break;
       case 'error': card('fail', 'error', e.message); break;
     }
   });
