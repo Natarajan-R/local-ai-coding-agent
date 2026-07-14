@@ -1,6 +1,5 @@
 node_modules/
 out/
-*.vsix
 
 # The root .gitignore blanket-ignores .vscode/, but an extension project needs its
 # launch config committed so F5 launches the Extension Development Host out of the box.

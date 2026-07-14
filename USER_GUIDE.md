@@ -242,27 +242,37 @@ get a **hint box**.
 
 Drive the agent from inside VS Code, with **native Approve/Deny and hint dialogs**.
 
-1. Start the server: `ai-agent serve --workspace .` — it prints a URL with a
-   per-session token, e.g. `http://127.0.0.1:8765/?token=ab12…`. **Copy that token.**
-2. Build the extension:
-   ```bash
-   cd vscode-extension
-   npm install
-   npm run compile
-   ```
-3. Open the `vscode-extension` folder in VS Code and press **F5** to launch an
-   Extension Development Host. (The folder ships a `.vscode/launch.json`, so F5 works
-   directly — no debug config to create. If you edit `src/extension.ts`, re-run
-   `npm run compile` before pressing F5 again, since it runs the compiled `out/`.)
-4. Paste the token into **Settings → `aiAgent.token`** (the `serve` process gates the
-   WebSocket with it; without it the extension is rejected with a 403). The token
-   changes each time you restart `serve`.
-5. Use the command palette: **AI Agent: Open Dashboard** or **AI Agent: Run Task…**
+### Install it (recommended — one command)
 
-> **Quick local demo?** Run `ai-agent serve --no-auth --workspace .` and leave
-> `aiAgent.token` blank. The server allows `--no-auth` only on a loopback address
-> (`127.0.0.1`), so nothing off-machine can reach it — fine for a local demo, but
-> keep the token for anything shared.
+The repo ships a prebuilt package, so you don't need Node or a build step:
+```bash
+code --install-extension vscode-extension/ai-coding-agent-0.1.0.vsix
+```
+(Or in VS Code: **Extensions → ⋯ → Install from VSIX…** and pick the `.vsix`.) The
+extension is now available in **every** VS Code window — permanently, no dev host.
+
+*Prefer to build it yourself?* `cd vscode-extension && npm install && npm run package`
+produces the same `.vsix`.
+
+### Use it
+
+1. Start the server. For a quick local run, disable the token:
+   ```bash
+   ai-agent serve --no-auth --workspace .
+   ```
+   For a shared/secure setup, use `ai-agent serve --workspace .`, copy the
+   `?token=…` it prints, and paste it into **Settings → `aiAgent.token`** (the server
+   gates the WebSocket with it; without it the extension is rejected with a 403).
+2. Command Palette → **AI Agent: Open Dashboard** or **AI Agent: Run Task…**
+
+> `--no-auth` is allowed only on a loopback address (`127.0.0.1`), so nothing
+> off-machine can reach it — fine locally, but keep the token for anything shared.
+
+### Develop it (optional)
+
+Open the `vscode-extension` folder and press **F5** to launch an Extension
+Development Host — the folder ships a `.vscode/launch.json`, so F5 works with no setup.
+Re-run `npm run compile` after editing `src/`, since F5 runs the compiled `out/`.
 
 Settings: `aiAgent.serverUrl` (default `ws://127.0.0.1:8765`), `aiAgent.token`, and
 `aiAgent.autoApprove`. See [vscode-extension/README.md](vscode-extension/README.md).

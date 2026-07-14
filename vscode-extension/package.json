@@ -5,6 +5,7 @@
   "version": "0.1.0",
   "publisher": "ai-coding-agent",
   "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/Natarajan-R/local-ai-coding-agent.git" },
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Other"],
   "activationEvents": [],
@@ -44,7 +45,8 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --allow-missing-repository"
   },
   "dependencies": {
     "ws": "^8.16.0"

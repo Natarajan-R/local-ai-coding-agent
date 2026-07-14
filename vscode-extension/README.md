@@ -10,16 +10,32 @@ This reuses the exact server protocol described in `expert_review.md` §7 (Path 
 agent server + webview) — the browser dashboard (`ai-agent serve`) and this
 extension are two clients of the same local WebSocket server.
 
+## Install (recommended)
+
+A prebuilt package ships in this folder — no Node or build step needed:
+
+```bash
+code --install-extension vscode-extension/ai-coding-agent-0.1.0.vsix
+```
+
+Or in VS Code: **Extensions → ⋯ → Install from VSIX…**. The extension is then in
+every VS Code window permanently. Then run the agent server and use the commands
+(see [Prerequisites](#prerequisites) and [Commands](#build--run-development)).
+
 ## Prerequisites
 
 1. Install and run the agent server (from the repo root):
    ```bash
    pip install -e '.[web]'      # or: pip install -r requirements-dev.txt
-   ai-agent serve --workspace .  # serves ws://127.0.0.1:8765
+   ai-agent serve --no-auth --workspace .   # serves ws://127.0.0.1:8765 (no token)
    ```
-2. Node.js 18+ to build the extension.
+   For a shared/secure setup, drop `--no-auth` and paste the printed `?token=…` into
+   the `aiAgent.token` setting.
+2. Node.js 18+ — only if you want to **build** the extension yourself (below).
 
 ## Build & run (development)
+
+Rebuild the `.vsix` yourself with `npm install && npm run package`. To develop:
 
 ```bash
 cd vscode-extension
