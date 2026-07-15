@@ -263,10 +263,19 @@ produces the same `.vsix`.
    For a shared/secure setup, use `ai-agent serve --workspace .`, copy the
    `?token=…` it prints, and paste it into **Settings → `aiAgent.token`** (the server
    gates the WebSocket with it; without it the extension is rejected with a 403).
-2. Command Palette → **AI Agent: Open Dashboard** or **AI Agent: Run Task…**
+2. **Check the port it prints.** `serve` defaults to 8765 but silently picks the next
+   free port (8766, …) if 8765 is taken — while the extension looks at
+   `ws://127.0.0.1:8765`. If the printed URL isn't 8765, either free 8765 and restart,
+   or set **`aiAgent.serverUrl`** to match (e.g. `ws://127.0.0.1:8766`). A mismatch
+   just looks like "the extension won't connect".
+3. Command Palette → **AI Agent: Open Dashboard** or **AI Agent: Run Task…**
 
 > `--no-auth` is allowed only on a loopback address (`127.0.0.1`), so nothing
 > off-machine can reach it — fine locally, but keep the token for anything shared.
+
+> Leave `--auto` **off** (the default) if you want the native Approve/Deny dialog:
+> dangerous commands are still hard-blocked by the guardrails *before* the approval
+> gate, so only genuinely allowed commands ever prompt you.
 
 ### Develop it (optional)
 
