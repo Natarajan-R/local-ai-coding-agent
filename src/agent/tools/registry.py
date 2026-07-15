@@ -380,12 +380,34 @@ class ToolRegistry:
         rows = [f"{h.path}:{h.line}: {h.kind} {h.name}" for h in hits]
         return ToolResult(True, f"{len(hits)} definition(s) for {name!r}:\n" + "\n".join(rows))
 
+    # Source suffixes that mark a *file name*. An import records the *module*
+    # ("from models import User" -> "models"), never the file ("models.py").
+    _MODULE_SUFFIXES = (".py", ".pyi", ".js", ".jsx", ".mjs", ".ts", ".tsx", ".go",
+                        ".rs", ".java", ".rb", ".c", ".h", ".cpp", ".cs")
+
+    @classmethod
+    def _as_module_name(cls, name: str) -> str:
+        """Turn whatever the caller has in hand into a module name.
+
+        The model reads a directory listing, so it asks about "models.py" — the only
+        name it has seen. The import table is keyed by module, so that lookup matched
+        nothing and the tool reported "No files import 'models.py'" for a module three
+        files import. A confident false negative is the worst answer an impact-analysis
+        tool can give: it says "safe to change" about the thing you are about to break.
+        """
+        stem = Path(name.strip()).name
+        for ext in cls._MODULE_SUFFIXES:
+            if stem.endswith(ext) and len(stem) > len(ext):
+                return stem[: -len(ext)]
+        return name.strip()
+
     def _find_importers(self, name: str) -> ToolResult:
-        rows = self._symbol_index().importers(name)
+        module = self._as_module_name(name)
+        rows = self._symbol_index().importers(module)
         if not rows:
-            return ToolResult(True, f"No files import {name!r}.")
-        out = [f"{path}:{line}: imports {module}" for path, line, module in rows]
-        return ToolResult(True, f"{len(rows)} importer(s) of {name!r}:\n" + "\n".join(out))
+            return ToolResult(True, f"No files import {module!r}.")
+        out = [f"{path}:{line}: imports {module_name}" for path, line, module_name in rows]
+        return ToolResult(True, f"{len(rows)} importer(s) of {module!r}:\n" + "\n".join(out))
 
     async def _run_command(self, command: str) -> ToolResult:
         if self.approval_callback is not None:
