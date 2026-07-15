@@ -198,6 +198,11 @@ function getHtml(webview: vscode.Webview): string {
       case 'run_started': feed.innerHTML=''; streamEl=null; statusEl.textContent='Running…'; card('', 'task', e.task); break;
       case 'state_changed': streamEl=null; card('', 'state', e.state); break;
       case 'token': ensureStream(e.label).textContent += e.text; break;
+      case 'memory_loaded': card('', 'memory', 'Recalled ' + e.count + ' fact(s) learned in previous runs'); break;
+      case 'context_trimmed': streamEl=null; card('', 'context trimmed',
+        (e.dropped ? 'Dropped ' + e.dropped + ' old step(s) to fit the window'
+                   : 'Truncated to fit the window') + ' — ~' + e.est_tokens + ' tokens sent'); break;
+      case 'escalation_resolved': card('ok', 'hint accepted', e.hint); break;
       case 'plan': streamEl=null; card('', 'plan', e.text); break;
       case 'tool_call': streamEl=null; card('tool', 'tool: ' + e.tool, JSON.stringify(e.args)); break;
       case 'tool_result': card(e.ok ? 'ok' : 'fail', 'result: ' + e.tool, e.content); break;
