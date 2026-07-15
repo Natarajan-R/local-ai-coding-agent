@@ -63,3 +63,37 @@ async def test_lsp_manager_noop_for_unknown_and_unavailable(tmp_path):
     assert await mgr.get_definition(tmp_path / "f.xx", 0, 0) == []
     assert await mgr.get_definition(tmp_path / "f.unknown", 0, 0) == []
     assert mgr.get_all_diagnostics() == "No diagnostics reported."
+
+
+def test_await_diagnostics_waits_for_the_server_then_returns(tmp_path):
+    """get_diagnostics must not answer 'clean' before the server has analysed.
+
+    Regression: diagnostics arrive ~1s after didOpen, so reading the cache straight
+    after a write reported "No diagnostics reported." for code with an obvious error —
+    a false all-clear the model then acted on.
+    """
+    client = LSPClient(tmp_path)
+    uri = (tmp_path / "x.py").resolve().as_uri()
+
+    client._expect_diagnostics(uri)
+    # Nothing published yet: must report that it gave up rather than claim success.
+    assert asyncio.run(client.await_diagnostics(timeout=0.2)) is False
+
+    client.diagnostics[uri] = []          # server answers (clean file -> empty list)
+    assert asyncio.run(client.await_diagnostics(timeout=0.2)) is True
+
+
+def test_expect_diagnostics_drops_the_stale_result(tmp_path):
+    """A re-edit must invalidate the previous diagnostics, not return them again.
+
+    Without the pop, await_diagnostics sees the *old* entry, returns instantly, and the
+    model is told about the bug it just fixed.
+    """
+    client = LSPClient(tmp_path)
+    uri = (tmp_path / "x.py").resolve().as_uri()
+    client.diagnostics[uri] = [{"message": "undefined name 'itms'"}]
+
+    client._expect_diagnostics(uri)       # file was just edited
+
+    assert uri not in client.diagnostics
+    assert asyncio.run(client.await_diagnostics(timeout=0.2)) is False

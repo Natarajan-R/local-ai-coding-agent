@@ -523,8 +523,12 @@ class ToolRegistry:
             out.append(f"File: {path_str}, Line {start.get('line', 0) + 1}, Col {start.get('character', 0) + 1}")
         return ToolResult(True, "\n".join(out))
 
-    def _get_diagnostics(self) -> ToolResult:
+    async def _get_diagnostics(self) -> ToolResult:
         if not self.lsp:
             return ToolResult(False, "LSP client not initialized")
+        # The server analyses in the background and pushes results ~1s later, so reading
+        # the cache straight after a write reports "No diagnostics reported." for code it
+        # has not looked at yet — a clean bill of health the model then acts on.
+        await self.lsp.await_diagnostics()
         res = self.lsp.get_all_diagnostics()
         return ToolResult(True, res)

@@ -53,4 +53,42 @@ against a task with two contradictory tests that can never both pass:
 > answered 120; the real number was 216). That's the tradeoff Chapter 34 states outright —
 > the sliding window "loses old *history*" — not something to advertise as a win.
 
+## [`carousel_post4.pdf`](carousel_post4.pdf) — "Your AI agent never reads your code"
+
+Your repo doesn't fit in a context window, so the agent indexes and queries it — like an
+IDE, not a chatbot (Ch 22–26):
+
+1. **Reads any language** — outlines Go, Rust and JavaScript from one parser (tree-sitter)
+2. **Knows where things live** — `find_symbol("Order")` → `models.py:9`
+3. **Knows what breaks** — "I'm changing `User`" → `api.py`, `db.py` … and *not* `billing.py`,
+   which imports `Order` from the same file. `grep models` gets that wrong
+4. **Searches everything** — one search, Python and Go together
+
+## [`carousel_post5.pdf`](carousel_post5.pdf) — "My AI agent runs a real language server"
+
+Compiler-grade answers instead of string matches (Ch 27–31):
+
+1. **Catches its own bugs** — writes code, the server flags `undefined name`, it fixes it,
+   the error clears. No tests involved
+2. **Follows the import** — `api.py` → `db.py:4`
+3. **Follows an alias** — `handlers.py` calls `persist`; that word appears **zero times**
+   in `db.py`, and the server still lands on line 4, column 5
+4. **Finds every use** — 5 references across 3 files, including one in a type annotation
+
+## [`carousel_post6.pdf`](carousel_post6.pdf) — "My AI agent's blast radius"
+
+Where the code runs, and what happens when the machine underneath fails (Ch 13–16, 35):
+
+1. **One command** — `ai-agent build-sandbox` builds the Dockerfile in this repo
+2. **Not your machine** — asked who and where it is, it answers with a container ID and the
+   image's user
+3. **No way out** — `pip install` inside the sandbox can't resolve a name;
+   `network_disabled` is the default
+4. **Model dies? Fine** — killed mid-run, it retries at 0.73 s then 1.95 s, gives up, and
+   reports why. No hang, no crash
+
+> Together these six carousels are the campaign that verified this book: **all 43 chapters
+> had their code driven end-to-end by hand, as a user.** It found **six real bugs — every
+> one in code that passed its unit tests.** They're listed in [`../ERRATA.md`](../ERRATA.md).
+
 Companion code for the book *Building a Local AI Coding Agent* by Natarajan Ramasamy.

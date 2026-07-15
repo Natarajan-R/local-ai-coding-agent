@@ -186,6 +186,9 @@ class _FakeLSP:
     def get_all_diagnostics(self):
         return "No diagnostics reported."
 
+    async def await_diagnostics(self, timeout: float = 5.0):
+        return True
+
     async def open_document(self, path, content):
         pass
 

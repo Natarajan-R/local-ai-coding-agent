@@ -436,7 +436,15 @@ class Orchestrator:
             console.print(f"[yellow]Transient error ({error}). Circuit: {metrics['state']}[/yellow]")
         else:
             console.print(f"[bold red]Error:[/bold red] {error}")
-        self.log.error("Error in state %s: %s", self.fsm.state.value, error, exc_info=True)
+        # A TransientError is an *expected* operational failure — the model server went
+        # away — and the console has already said so in one line. Dumping 30 lines of
+        # httpx internals on top of it buries the message and reads like a crash, when
+        # the agent in fact handled it exactly as designed. Keep the traceback for the
+        # unexpected errors, where it is the only clue you get.
+        self.log.error(
+            "Error in state %s: %s", self.fsm.state.value, error,
+            exc_info=not isinstance(error, TransientError),
+        )
         self._audit(
             "error", state=self.fsm.state.value, error=str(error),
             error_type=type(error).__name__, circuit=metrics["state"],

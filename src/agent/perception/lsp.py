@@ -72,6 +72,8 @@ class LSPClient:
         self._pending_requests: Dict[int, asyncio.Future] = {}
         # Mappings of file_uri -> list of diagnostic objects
         self.diagnostics: Dict[str, List[Dict[str, Any]]] = {}
+        # URIs synced to the server whose diagnostics push we are still waiting for.
+        self._pending_uris: set = set()
         self._ready = asyncio.Event()
         self._running = False
 
@@ -245,6 +247,7 @@ class LSPClient:
         if not await self._wait_ready():
             return
         uri = Path(path).resolve().as_uri()
+        self._expect_diagnostics(uri)
         params = {
             "textDocument": {
                 "uri": uri,
@@ -255,11 +258,45 @@ class LSPClient:
         }
         await self.send_notification("textDocument/didOpen", params)
 
+    def _expect_diagnostics(self, uri: str) -> None:
+        """Mark `uri` as awaiting a fresh diagnostics push.
+
+        Analysis is asynchronous: the server answers a didOpen/didChange with a
+        `publishDiagnostics` notification a second or so later. Dropping the previous
+        entry matters as much as recording the wait — otherwise `await_diagnostics`
+        sees the *stale* result sitting in the dict, returns instantly, and the model is
+        told about the bug it just fixed (or not told about the one it just wrote).
+        """
+        self.diagnostics.pop(uri, None)
+        self._pending_uris.add(uri)
+
+    async def await_diagnostics(self, timeout: float = 5.0) -> bool:
+        """Block until every synced document has fresh diagnostics. True if all arrived.
+
+        Without this, `get_all_diagnostics` reports whatever happens to have landed so
+        far — which right after a write is usually *nothing*, i.e. a clean bill of health
+        for code the server has not looked at yet. A diagnostics tool that races is worse
+        than none: it answers "no errors" when it means "don't know yet".
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while self._pending_uris - set(self.diagnostics):
+            if loop.time() >= deadline:
+                missing = sorted(self._pending_uris - set(self.diagnostics))
+                logger.warning(
+                    "Timed out after %.1fs waiting for diagnostics on %d document(s): %s",
+                    timeout, len(missing), ", ".join(Path(u[7:]).name for u in missing),
+                )
+                return False
+            await asyncio.sleep(0.05)
+        return True
+
     async def change_document(self, path: Path, content: str) -> None:
         """Sync a document modification to the language server."""
         if not await self._wait_ready():
             return
         uri = Path(path).resolve().as_uri()
+        self._expect_diagnostics(uri)
         params = {
             "textDocument": {
                 "uri": uri,
@@ -440,6 +477,11 @@ class LSPManager:
     async def get_references(self, path: Path, line: int, character: int) -> List[Dict[str, Any]]:
         client, _ = await self._client_for(path)
         return await client.get_references(path, line, character) if client is not None else []
+
+    async def await_diagnostics(self, timeout: float = 5.0) -> bool:
+        """Wait for every pooled server to answer. Same contract as the single client."""
+        results = [await c.await_diagnostics(timeout) for c in self._clients.values()]
+        return all(results)
 
     def get_all_diagnostics(self) -> str:
         parts = []
