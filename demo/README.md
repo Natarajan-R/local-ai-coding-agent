@@ -35,4 +35,22 @@ a real run in the [VS Code extension](../vscode-extension/):
 > building these demos the agent sometimes refused a dangerous command on its own and
 > sometimes didn't. A model's judgement is not a security boundary.
 
+## [`carousel_post3.pdf`](carousel_post3.pdf) — "What makes an AI coding agent production-grade?"
+
+What happens when the agent *can't* do the job. Each shown in a real run — the last two
+against a task with two contradictory tests that can never both pass:
+
+1. **Self-heals** — it fixes the bug you named and declares done; the test suite catches
+   a second one it never looked at, and it reads the failure and fixes that too
+2. **Remembers** — new session, empty folder, search finds nothing, and it still answers
+   from a fact learned in an earlier run
+3. **Asks for help** — out of retries, it doesn't fake a fix; it stops and asks for a hint
+4. **Fails safely** — no hint, so it exhausts its retry budget and stops. No infinite loop
+
+> **There is no context-trimming slide, on purpose.** The feature works, but every honest
+> demo of it showed the model losing track of its own history — repeating steps, skipping
+> others, and reporting success anyway (asked to count functions across six files, it
+> answered 120; the real number was 216). That's the tradeoff Chapter 34 states outright —
+> the sliding window "loses old *history*" — not something to advertise as a win.
+
 Companion code for the book *Building a Local AI Coding Agent* by Natarajan Ramasamy.

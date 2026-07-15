@@ -178,6 +178,16 @@ INDEX_HTML = """<!DOCTYPE html>
                 addEntry(data.passed ? "eval-ok" : "eval-bad",
                          (data.passed ? "✔ Evaluation passed — " : "✘ Evaluation failed — ") + data.summary);
             }
+            else if (data.event === "no_progress") {
+                addEntry("eval-bad", "↻ Repeated " + data.tool
+                         + " with no progress — stopping this phase and evaluating.");
+            }
+            else if (data.event === "give_up") {
+                addEntry("eval-bad", "■ Retry budget exhausted after " + data.retries
+                         + (data.retries === 1 ? " retry" : " retries")
+                         + ". Stopping instead of looping."
+                         + (data.summary ? "\\n" + data.summary : ""));
+            }
             else if (data.event === "run_finished") {
                 const s = data.stats || {};
                 addEntry("done", "● Session ended: " + data.final_state.toUpperCase()

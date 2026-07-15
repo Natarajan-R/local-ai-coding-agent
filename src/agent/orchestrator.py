@@ -344,6 +344,7 @@ class Orchestrator:
                     console.print("[yellow]Repeated actions without progress; moving to evaluation.[/yellow]")
                     self.log.warning("No-progress loop detected at step %d; aborting phase", step)
                     self._audit("no_progress_abort", step=step, tool=call.name, redundant=redundant)
+                    self.emit("no_progress", step=step, tool=call.name, redundant=redundant)
                     break
             else:
                 seen.add(sig)
@@ -408,6 +409,11 @@ class Orchestrator:
             console.print("[yellow]Retry budget exhausted.[/yellow]")
             self.log.info("Retry budget exhausted after %d retries", self.frame.retry_count)
             self._audit("give_up", retries=self.frame.retry_count)
+            # Why the run ended is the most important thing about a failed run, so it
+            # must reach every surface — not just the console. Without this emit, a
+            # dashboard or editor client shows a bare "error" with no reason.
+            self.emit("give_up", retries=self.frame.retry_count,
+                      summary=self.frame.last_error_summary or "")
             self.fsm.transition("give_up")
             return
         self.frame.retry_count += 1

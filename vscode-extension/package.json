@@ -5,9 +5,16 @@
   "version": "0.1.0",
   "publisher": "ai-coding-agent",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/Natarajan-R/local-ai-coding-agent.git" },
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Other"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Natarajan-R/local-ai-coding-agent.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
   "activationEvents": [],
   "main": "./out/extension.js",
   "contributes": {
@@ -18,7 +25,7 @@
       },
       {
         "command": "aiAgent.runTask",
-        "title": "AI Agent: Run Task…"
+        "title": "AI Agent: Run Task\u2026"
       }
     ],
     "configuration": {
@@ -32,7 +39,7 @@
         "aiAgent.token": {
           "type": "string",
           "default": "",
-          "description": "Session token printed by `ai-agent serve` (the ?token=… value). Required unless the server runs with --no-auth."
+          "description": "Session token printed by `ai-agent serve` (the ?token=\u2026 value). Required unless the server runs with --no-auth."
         },
         "aiAgent.autoApprove": {
           "type": "boolean",
@@ -46,7 +53,8 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "vsce package --allow-missing-repository"
+    "package": "npm run compile && npm run check-webview && npx --yes @vscode/vsce package --allow-missing-repository",
+    "check-webview": "node scripts/check-webview.js out/extension.js"
   },
   "dependencies": {
     "ws": "^8.16.0"

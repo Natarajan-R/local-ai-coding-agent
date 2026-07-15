@@ -9,6 +9,10 @@ import WebSocket from "ws";
 let panel: vscode.WebviewPanel | undefined;
 let socket: WebSocket | undefined;
 let output: vscode.OutputChannel;
+// The server sends `connected` (with the model/workspace config) once, the moment the
+// socket opens — long before a webview exists to hear it. Keep it so a panel opened
+// later can still be told what it is connected *to*, not merely that it is connected.
+let lastConnected: unknown;
 
 export function activate(context: vscode.ExtensionContext): void {
   output = vscode.window.createOutputChannel("AI Coding Agent");
@@ -58,7 +62,10 @@ function ensureSocket(): WebSocket {
   output.appendLine(`Connecting to ${url}`);
   socket = new WebSocket(url);
   socket.on("open", () => toWebview({ event: "host_status", connected: true }));
-  socket.on("close", () => toWebview({ event: "host_status", connected: false }));
+  socket.on("close", () => {
+    lastConnected = undefined;
+    toWebview({ event: "host_status", connected: false });
+  });
   socket.on("error", (err: Error) => {
     output.appendLine(`WebSocket error: ${err.message}`);
     toWebview({ event: "error", message: `Cannot reach ${url}. Is 'ai-agent serve' running?` });
@@ -76,6 +83,9 @@ function ensureSocket(): WebSocket {
 }
 
 async function handleServerEvent(msg: any): Promise<void> {
+  if (msg.event === "connected") {
+    lastConnected = msg;
+  }
   // Always mirror the event into the webview for the live view.
   toWebview(msg);
 
@@ -114,7 +124,18 @@ function openDashboard(context: vscode.ExtensionContext): void {
       panel = undefined;
     });
     panel.webview.onDidReceiveMessage((m: any) => {
-      if (m.type === "run") {
+      if (m.type === "ready") {
+        // The webview's script loads well after the socket connects, and VS Code drops
+        // messages posted to a webview that isn't listening yet — so a fresh panel never
+        // sees the 'open'/'connected' events and would sit on "Connecting…" forever
+        // while actually connected. It tells us when it's ready; we replay what it
+        // missed. `connected` goes last: it carries the model name, and its status line
+        // ("Ready · <model>") is the better one to leave on screen.
+        toWebview({ event: "host_status", connected: socket?.readyState === WebSocket.OPEN });
+        if (lastConnected) {
+          toWebview(lastConnected);
+        }
+      } else if (m.type === "run") {
         sendToServer({ type: "run", task: m.task, options: { interactive: !config<boolean>("autoApprove", false) } });
       }
     });
@@ -203,6 +224,11 @@ function getHtml(webview: vscode.Webview): string {
         (e.dropped ? 'Dropped ' + e.dropped + ' old step(s) to fit the window'
                    : 'Truncated to fit the window') + ' — ~' + e.est_tokens + ' tokens sent'); break;
       case 'escalation_resolved': card('ok', 'hint accepted', e.hint); break;
+      case 'no_progress': streamEl=null; card('fail', 'no progress',
+        'Repeated ' + e.tool + ' with no progress — stopping this phase and evaluating'); break;
+      case 'give_up': streamEl=null; card('fail', 'gave up',
+        'Retry budget exhausted after ' + e.retries + (e.retries === 1 ? ' retry' : ' retries')
+        + '. Stopping instead of looping.' + (e.summary ? '\\n' + e.summary : '')); break;
       case 'plan': streamEl=null; card('', 'plan', e.text); break;
       case 'tool_call': streamEl=null; card('tool', 'tool: ' + e.tool, JSON.stringify(e.args)); break;
       case 'tool_result': card(e.ok ? 'ok' : 'fail', 'result: ' + e.tool, e.content); break;
@@ -211,7 +237,9 @@ function getHtml(webview: vscode.Webview): string {
       case 'approval_required': card('', 'approval (answer in the VS Code prompt)', e.detail); break;
       case 'escalation_required': card('', 'stuck — hint requested (see prompt)', e.context); break;
       case 'run_finished': statusEl.textContent='Finished: ' + e.final_state;
-        card(e.final_state==='done'?'ok':'fail', 'summary', e.summary || '');
+        // Only the finish tool sets a summary, so a run that gave up or errored has
+        // none — don't render an empty labelled card. The give_up card carries the why.
+        if (e.summary) card(e.final_state==='done'?'ok':'fail', 'summary', e.summary);
         if (e.stats) card('', 'telemetry', e.stats.model_calls + ' model calls · '
           + e.stats.total_tokens + ' tokens · ' + (e.stats.total_seconds||0).toFixed(1)
           + 's · $0.00'); break;
@@ -222,6 +250,9 @@ function getHtml(webview: vscode.Webview): string {
     const task = document.getElementById('task').value.trim();
     if (task) vscode.postMessage({ type: 'run', task });
   });
+  // Announce that the listener above is live, so the host can send us the connection
+  // state we were too late to hear about.
+  vscode.postMessage({ type: 'ready' });
 </script>
 </body>
 </html>`;

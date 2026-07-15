@@ -1,0 +1,27 @@
+# Errata — *Building a Local AI Coding Agent*
+
+Corrections to the published edition, found by running **every chapter's code as an end
+user** — driving the agent the way you would, rather than calling its internals from a
+test. Each one is already fixed in this repository, so if you are working from the code
+here you have the corrected version. The Kindle edition is updated periodically.
+
+Reproduce any of these yourself with **[`EXAMPLES.md`](EXAMPLES.md)**.
+
+| # | Where | What the book says | The correction |
+| --- | --- | --- | --- |
+| 1 | **Preface** §2 (model table) | Describes `qwen2.5:7b` as "Qwen 2.5 **Coder** 7B" | It is **Qwen 2.5 7B Instruct**, not the Coder variant (`qwen2.5-coder:7b`). The repo's own evaluation is why: Instruct beat Coder **12/12 vs 10/12** on the edit-an-existing-file loop. |
+| 2 | **Ch 15** — Sandbox Manager Facade | `"auto"` picks Docker whenever the daemon is reachable | That fails with a container-pull 404 when the **image was never built**. `"auto"` now also checks the image exists, and falls back to the local sandbox with a hint to run `ai-agent build-sandbox`. |
+| 3 | **Ch 42** — The Dashboard Page | The reference UI is display-only | It is now a self-contained control surface: task input, Run button, and a live activity feed. You can drive a whole run from the browser. |
+| 4 | **Ch 10** — Execution Loop, **Ch 20** — Secret Redaction | Secrets are "redacted before the model ever sees it" | Redaction was only applied to `run_command` output, so **`read_file` leaked secrets into the model's context and the console**. Every tool result is now scrubbed once at the boundary — which is what Ch 20 always claimed. |
+| 5 | **Preface** §3, **Ch 4**, both appendices | `pip install python-lsp-server` | **pylsp alone reports no diagnostics** — it ships no linter plugins, so `get_diagnostics` (Ch 27–31) silently returns "No diagnostics reported." Install `python-lsp-server[pyflakes,pycodestyle]` instead. |
+| 6 | **Ch 39** — Human Escalations, **Ch 10** — Execution Loop | Giving up and the no-progress abort `console.print` + audit + transition | They never **emitted** an event, so every non-terminal surface — the web dashboard and the VS Code extension — showed a bare `error` with **no reason why the run stopped**, while a terminal user watching the same run saw the explanation. Both now emit (`give_up`, `no_progress`) and both UIs render them. Any decision worth printing is a decision worth emitting. |
+
+---
+
+Errata 2, 4, 5 and 6 were each found the same way: by using the agent, not by testing it.
+A unit test asserts that a function returns what you expected. It cannot notice that the
+dashboard has no input box, that a secret reached the console, that the LSP is quietly
+answering "no diagnostics" for every file, or that the agent gave up without telling you
+why. Those only surface when you sit down and drive the thing.
+
+Companion code for the book *Building a Local AI Coding Agent* by Natarajan Ramasamy.
