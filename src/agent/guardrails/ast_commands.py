@@ -97,6 +97,35 @@ def _resolve_words(command_node, var_map: Dict[str, str]) -> Tuple[List[str], Li
     return words, unresolved
 
 
+# Interpreters that take a program as a *string argument*. The shell AST sees
+# `sh -c "rm -rf /"` as a call to `sh` with an opaque string, so every check below
+# used to pass. The flag is where the real command hides.
+_INLINE_SHELL_FLAGS = {"-c"}
+_INLINE_CODE_FLAGS = {
+    "python": {"-c"}, "python2": {"-c"}, "python3": {"-c"},
+    "perl": {"-e", "-E"}, "ruby": {"-e"}, "node": {"-e", "--eval", "-p"},
+    "php": {"-r"}, "lua": {"-e"},
+}
+# Ways inline code in a non-shell language reaches a shell. We cannot parse Python
+# or JS here, so we refuse the *combination* of "inline code" + "shells out" rather
+# than trying to understand it.
+_SHELLS_OUT = (
+    "os.system", "subprocess", "os.popen", "os.exec", "os.spawn", "pty.spawn",
+    "shutil.rmtree", "child_process", "exec(", "eval(", "system(", "`",
+)
+
+
+def _inline_program(exe: str, args: List[str]) -> Optional[str]:
+    """Return code passed inline to an interpreter (`sh -c "…"`, `python -c "…"`)."""
+    flags = _INLINE_SHELL_FLAGS if exe in SHELL_EXECUTABLES else _INLINE_CODE_FLAGS.get(exe)
+    if not flags:
+        return None
+    for i, a in enumerate(args):
+        if a in flags and i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
 def _check_words(words: List[str], unresolved: Optional[List[bool]] = None) -> Optional[str]:
     if not words:
         return None
@@ -107,6 +136,36 @@ def _check_words(words: List[str], unresolved: Optional[List[bool]] = None) -> O
 
     if exe in DENY_EXECUTABLES or exe.startswith("mkfs"):
         return f"blocked executable: {exe}"
+
+    # `sh -c "<anything>"` — re-run the whole guard on the inline program. A shell
+    # inside a shell is still a shell, so the same rules must apply to it.
+    inline = _inline_program(exe, args)
+    if inline is not None:
+        if exe in SHELL_EXECUTABLES:
+            nested = ast_check(inline)
+            if nested is not None and not nested[0]:
+                return f"blocked: `{exe} -c` running a blocked command — {nested[1]}"
+        elif any(tok in inline for tok in _SHELLS_OUT):
+            # e.g. python -c "import os; os.system('rm -rf /')". We can't parse the
+            # language, so inline code that reaches for a shell is refused outright.
+            return (
+                f"blocked: inline `{exe}` code that shells out — run it as a script "
+                "file so it can be reviewed"
+            )
+
+    # `eval "rm -rf /"` — a shell builtin that runs its argument.
+    if exe == "eval" and args:
+        nested = ast_check(" ".join(args))
+        if nested is not None and not nested[0]:
+            return f"blocked: `eval` running a blocked command — {nested[1]}"
+
+    # `find / -delete` / `find / -exec rm -rf {} ;` never touches a blocked exe name
+    # in first position, so it slipped past every check above.
+    if exe == "find":
+        targets = [a for a in args if not a.startswith("-")]
+        dangerous = any(t in _DANGEROUS_TARGETS or t == "/" for t in targets[:1])
+        if dangerous and ("-delete" in args or "-exec" in args or "-execdir" in args):
+            return "blocked: destructive `find` over a dangerous path"
 
     # An unresolved variable in a destructive command could expand to anything
     # (e.g. `rm -rf $ROOT` where ROOT=/). Refuse to auto-run it.
