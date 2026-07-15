@@ -14,11 +14,16 @@ which is conservative enough for budgeting without pulling in a tokenizer.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Dict, List
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_CHARS_PER_TOKEN = 4.0
 PER_MESSAGE_OVERHEAD_TOKENS = 4  # role tags, delimiters, etc.
+TRUNCATE_FLOOR_CHARS = 200      # never shrink a message's content below this
+TRUNCATE_MARKER = "\n[... truncated to fit context ...]"
 
 
 @dataclass
@@ -108,14 +113,49 @@ class ContextManager:
         return TrimResult(rebuilt, True, dropped, self.total_tokens(rebuilt))
 
     def _hard_truncate(self, messages: List[Dict]) -> List[Dict]:
+        """Shrink the largest contents until they fit, sparing the system prompt.
+
+        The system message holds the rules and the tool schema — the very things whose
+        loss "lobotomizes" the agent (Chapter 32). Picking the globally largest message
+        each pass would eat it: once the tool results have been cut down a few times the
+        system prompt *becomes* the largest, and the two then alternate, damaging the
+        rules while the tool results still had room to shrink. So exhaust everything else
+        down to the floor first, and touch the system prompt only if it is the last thing
+        left — which means the budget cannot hold the rules at all, and the run is doomed
+        whatever we do. Say so loudly rather than silently.
+        """
         msgs = [dict(m) for m in messages]
+        system = [i for i, m in enumerate(msgs) if m.get("role") == "system"]
+        other = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+        exhausted: set = set()
+
+        def pool_of(idxs):
+            return [i for i in idxs if i not in exhausted]
+
+        warned = False
         guard = 0
         while self.total_tokens(msgs) > self.budget and guard < 1000:
             guard += 1
-            idx = max(range(len(msgs)), key=lambda i: len(str(msgs[i].get("content", ""))))
-            content = str(msgs[idx].get("content", ""))
-            if len(content) <= 200:
+            pool = pool_of(other) or pool_of(system)
+            if not pool:
                 break  # nothing left worth shrinking
-            new_len = max(200, int(len(content) * 0.6))
-            msgs[idx]["content"] = content[:new_len] + "\n[... truncated to fit context ...]"
+            if not pool_of(other) and not warned:
+                warned = True
+                sys_tokens = sum(self._msg_tokens(msgs[i]) for i in system)
+                logger.warning(
+                    "Context budget (%d tokens) is too small for the system prompt (~%d). "
+                    "Truncating the agent's own rules and tool schema — it will hallucinate "
+                    "tool calls and misbehave. Raise the context window to about %d or more.",
+                    self.budget, sys_tokens, sys_tokens + self.response_reserve + 512,
+                )
+            idx = max(pool, key=lambda i: len(str(msgs[i].get("content", ""))))
+            content = str(msgs[idx].get("content", ""))
+            shrunk = content[:max(TRUNCATE_FLOOR_CHARS, int(len(content) * 0.6))] + TRUNCATE_MARKER
+            # The marker is itself ~35 chars, so a message bottoms out a little above the
+            # floor. Without this check `len(content) > floor` stays true forever, the
+            # rewrite is a no-op, and the loop spins to the guard on every oversized call.
+            if len(shrunk) >= len(content):
+                exhausted.add(idx)
+                continue
+            msgs[idx]["content"] = shrunk
         return msgs
