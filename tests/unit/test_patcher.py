@@ -68,3 +68,43 @@ def test_fuzzy_can_be_disabled():
     content = "def f():\n\treturn 1\n"  # tab-indented; no exact space match
     with pytest.raises(ToolError):
         apply_search_replace(content, "    return 1", "    return 2", fuzzy=False)
+
+
+# --- regex-escaped search blocks -------------------------------------------
+# A field named "search" reads like a pattern, so the model escapes what it puts
+# there: `record\["id"\]` against a file holding `record["id"]`. Measured as the
+# entire residual Tier 3 failure — the one call site with brackets never landed,
+# and re-reading could not help because the model re-derived the same escaped
+# form from the same line every time.
+
+API_LINE = 'def get_user(record):\n    return UserResponse(user_id=record["id"])\n'
+
+
+def test_regex_escaped_search_block_still_matches():
+    out = apply_search_replace(
+        API_LINE,
+        'user_id=record\\["id"\\]',
+        'uuid=record\\["id"\\]',
+    )
+    assert 'uuid=record["id"]' in out
+    # the escapes must NOT survive into the file
+    assert "\\[" not in out
+
+
+def test_escaped_replacement_does_not_inject_backslashes():
+    out = apply_search_replace(API_LINE, 'record\\["id"\\]', 'record\\["uuid"\\]')
+    assert 'record["uuid"]' in out
+    assert "\\" not in out
+
+
+def test_a_file_that_really_contains_backslashes_is_untouched_by_the_fallback():
+    # The exact match wins first, so the fallback never sees this.
+    content = 'PATTERN = re.compile(r"\\[id\\]")\n'
+    out = apply_search_replace(content, 'r"\\[id\\]"', 'r"\\[uuid\\]"')
+    assert 'r"\\[uuid\\]"' in out
+
+
+def test_unescaped_fallback_still_refuses_ambiguity():
+    content = 'a = x["id"]\nb = x["id"]\n'
+    with pytest.raises(ToolError):
+        apply_search_replace(content, 'x\\["id"\\]', 'x\\["uuid"\\]')

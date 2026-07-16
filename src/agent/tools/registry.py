@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, List, Optional
 from ..errors import ToolError
 from ..perception.analysis import syntax_note
 from ..perception.lsp import LSPClient
-from .patcher import apply_and_diff, make_diff
+from .patcher import _strip_regex_escapes, apply_and_diff, make_diff
 
 logger = logging.getLogger(__name__)
 
@@ -122,12 +122,19 @@ class ToolRegistry:
         ))
         self.register(Tool(
             "search_replace",
-            "Replace an exact block of text in a file. The search block must be unique.",
+            "Replace an exact block of text in a file. The search block must be unique. "
+            "`search` is LITERAL text, NOT a regular expression — copy it verbatim from "
+            "the file and do not escape any characters.",
             {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "search": {"type": "string", "description": "Exact text to find"},
+                    "search": {
+                        "type": "string",
+                        "description": "Literal text to find, copied verbatim from the "
+                                       "file. NOT a regex: write record[\"id\"], never "
+                                       "record\\[\"id\"\\].",
+                    },
                     "replace": {"type": "string", "description": "Replacement text"},
                 },
                 "required": ["path", "search", "replace"],
@@ -139,12 +146,17 @@ class ToolRegistry:
             "Rename or replace EVERY occurrence of an exact string in one file, in a "
             "single step. Use this instead of search_replace when the same text appears "
             "more than once (renaming a field, a variable, a function). Returns the "
-            "number of occurrences changed and a diff.",
+            "number of occurrences changed and a diff. `old` is LITERAL text, NOT a "
+            "regular expression — do not escape any characters.",
             {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "old": {"type": "string", "description": "Exact text to replace everywhere"},
+                    "old": {
+                        "type": "string",
+                        "description": "Literal text to replace everywhere. NOT a regex: "
+                                       "write record[\"id\"], never record\\[\"id\"\\].",
+                    },
                     "new": {"type": "string", "description": "Replacement text"},
                 },
                 "required": ["path", "old", "new"],
@@ -448,7 +460,20 @@ class ToolRegistry:
         original = await asyncio.to_thread(target.read_text, encoding="utf-8", errors="replace")
         count = original.count(old)
         if count == 0:
-            return ToolResult(False, f"{old!r} does not appear in {path}")
+            # `old` may be regex-escaped (`record\["id"\]`) rather than literal — models
+            # read a field named "old"/"search" as a pattern. Retry unescaped; harmless,
+            # because if the file really contained those backslashes we'd have matched.
+            unescaped_old = _strip_regex_escapes(old)
+            if unescaped_old != old and original.count(unescaped_old) > 0:
+                old, new = unescaped_old, _strip_regex_escapes(new)
+                count = original.count(old)
+            else:
+                return ToolResult(
+                    False,
+                    f"{old!r} does not appear in {path}. Note: `old` is matched as "
+                    f"LITERAL text, not a regular expression — do not escape "
+                    f"characters like [ ] ( ) . *",
+                )
         updated = original.replace(old, new)
         await asyncio.to_thread(target.write_text, updated, encoding="utf-8")
         if self.lsp:
