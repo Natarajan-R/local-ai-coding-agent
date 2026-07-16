@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, List, Optional
 from ..errors import ToolError
 from ..perception.analysis import syntax_note
 from ..perception.lsp import LSPClient
-from .patcher import apply_and_diff
+from .patcher import apply_and_diff, make_diff
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +133,23 @@ class ToolRegistry:
                 "required": ["path", "search", "replace"],
             },
             self._search_replace,
+        ))
+        self.register(Tool(
+            "replace_all",
+            "Rename or replace EVERY occurrence of an exact string in one file, in a "
+            "single step. Use this instead of search_replace when the same text appears "
+            "more than once (renaming a field, a variable, a function). Returns the "
+            "number of occurrences changed and a diff.",
+            {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old": {"type": "string", "description": "Exact text to replace everywhere"},
+                    "new": {"type": "string", "description": "Replacement text"},
+                },
+                "required": ["path", "old", "new"],
+            },
+            self._replace_all,
         ))
         self.register(Tool(
             "list_files",
@@ -408,6 +425,47 @@ class ToolRegistry:
             return ToolResult(True, f"No files import {module!r}.")
         out = [f"{path}:{line}: imports {module_name}" for path, line, module_name in rows]
         return ToolResult(True, f"{len(rows)} importer(s) of {module!r}:\n" + "\n".join(out))
+
+    async def _replace_all(self, path: str, old: str, new: str) -> ToolResult:
+        """Replace every occurrence of `old` in one file.
+
+        `search_replace` deliberately refuses an ambiguous match (Chapter 12): precise,
+        reviewable, one site at a time. That is right for "fix this function" and wrong
+        for "rename this field", where the model must then build a uniquely-worded edit
+        for every site — against a file that changes under it after the first one. It
+        can't, and measurably doesn't: a 9-site rename landed 1 of 9.
+
+        So this is the blunt sibling: one call, one file, every occurrence, with the
+        count and a diff back so the edit stays reviewable. It is a *substring* replace
+        and will happily turn `user_id` inside `user_idx` — hence the diff, and hence
+        the evaluator running the tests afterwards.
+        """
+        target = self._safe_path(path)
+        if not target.exists():
+            return ToolResult(False, f"File not found: {path}")
+        if not old:
+            return ToolResult(False, "`old` must not be empty")
+        original = await asyncio.to_thread(target.read_text, encoding="utf-8", errors="replace")
+        count = original.count(old)
+        if count == 0:
+            return ToolResult(False, f"{old!r} does not appear in {path}")
+        updated = original.replace(old, new)
+        await asyncio.to_thread(target.write_text, updated, encoding="utf-8")
+        if self.lsp:
+            try:
+                await self.lsp.open_document(target, updated)
+                await self.lsp.change_document(target, updated)
+            except Exception:
+                pass
+        if self._symbols is not None:
+            self._symbols.refresh()
+        diff = make_diff(original, updated, path)
+        note = syntax_note(path, updated)
+        self.policy.audit.record("replace_all", path=path, count=count, syntax_ok=not note)
+        body = f"Replaced {count} occurrence(s) of {old!r} with {new!r} in {path}:\n{diff}"
+        if note:
+            body += f"\n{note}"
+        return ToolResult(True, body)
 
     async def _run_command(self, command: str) -> ToolResult:
         if self.approval_callback is not None:

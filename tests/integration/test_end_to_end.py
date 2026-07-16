@@ -198,6 +198,7 @@ async def test_non_consecutive_repeat_loop_breaks(workspace):
 async def test_context_is_trimmed_before_sending(workspace):
     # A model that pads its output so history grows past a small context window.
     # The orchestrator must trim each call to fit the budget before sending.
+    from agent import prompts
     from agent.context import ContextManager
 
     seen_max = {"tokens": 0}
@@ -226,9 +227,16 @@ async def test_context_is_trimmed_before_sending(workspace):
                 return ChatResponse(content=_tool_call("write_file", path=f"f{self.n}.py", content=pad))
             return ChatResponse(content=_tool_call("finish", summary="done"))
 
+    # num_ctx must leave room for the system prompt AND working space. "Fits the
+    # budget" and "the rules are never truncated" are both promises, but they
+    # conflict once the system prompt alone approaches the budget — and there the
+    # rules win by design (see the errata on _hard_truncate: better to overshoot
+    # the window than lobotomize the agent). This test is about trimming, so give
+    # it a context where the premise actually holds; the sparing behaviour is
+    # asserted below and the too-small case has its own coverage in test_context.
     orch = Orchestrator(
         workspace=workspace, interactive=False, sandbox_backend="local",
-        num_ctx=2500, max_steps=8, max_retries=0,
+        num_ctx=4096, max_steps=8, max_retries=0,
     )
     fake = CapturingModel()
     _install_fake(orch, fake)
@@ -238,6 +246,8 @@ async def test_context_is_trimmed_before_sending(workspace):
     # Every prompt the model received stayed within the token budget.
     assert seen_max["tokens"] <= orch.context.budget
     assert orch.fsm.is_terminal()
+    # ...and trimming never came for the agent's own rules.
+    assert cm.total_tokens([{"role": "system", "content": prompts.SYSTEM_PROMPT}]) < orch.context.budget
 
 
 def _ollama_available():

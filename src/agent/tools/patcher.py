@@ -64,7 +64,9 @@ def apply_search_replace(content: str, search: str, replace: str, fuzzy: bool = 
         return content.replace(search, replace, 1)
     if count > 1:
         raise ToolError(
-            f"search block is ambiguous (found {count} times); add more context"
+            f"search block is ambiguous (found {count} times). To change every "
+            f"occurrence use the `replace_all` tool; to change one, add surrounding "
+            f"context to make the search block unique."
         )
 
     # count == 0: try the whitespace-tolerant fallback.
@@ -73,7 +75,11 @@ def apply_search_replace(content: str, search: str, replace: str, fuzzy: bool = 
         if fuzzy_result is not None:
             return fuzzy_result
 
-    raise ToolError("search block not found in file")
+    raise ToolError(
+        "search block not found in file. The file may already have been edited since "
+        "you last read it — re-read it, or use `replace_all` to change every occurrence "
+        "of a string in one step."
+    )
 
 
 def make_diff(before: str, after: str, path: str = "file") -> str:

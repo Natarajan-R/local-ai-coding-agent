@@ -5,6 +5,7 @@ import asyncio
 import logging
 import sys
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
@@ -37,6 +38,9 @@ console = Console()
 
 # Default bound on tool calls within a single execution phase.
 DEFAULT_MAX_STEPS = 25
+
+# Tools that change the workspace. Everything else only looks.
+MUTATING_TOOLS = frozenset({"write_file", "search_replace", "replace_all"})
 # Default number of attempts for a single model call before giving up.
 DEFAULT_MODEL_RETRIES = 3
 
@@ -63,6 +67,12 @@ class Orchestrator:
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.max_steps = max_steps
+        # A green test suite only proves the agent finished if the agent actually
+        # did something. On a refactor the suite is green BEFORE the first edit, so
+        # an agent that stalls without touching a file evaluates green and reaches
+        # `done` having changed nothing. Track both halves of that condition.
+        self._mutations = 0            # successful workspace edits, whole run
+        self._no_progress_abort = False  # the loop detector bailed at some point
         self.run_id = uuid.uuid4().hex[:8]
         # Optional structured-event sink (e.g. the web server broadcaster).
         self._event_sink = event_sink
@@ -305,6 +315,8 @@ class Orchestrator:
             safe_content = self.policy.scrub(result.content)
             console.print(f"[dim]{safe_content[:500]}[/dim]")
             self.log.info("step %d: %s ok=%s", step, call.name, result.ok)
+            if result.ok and call.name in MUTATING_TOOLS:
+                self._mutations += 1
             self._audit(
                 "tool_call", step=step, tool=call.name,
                 args=list(call.arguments), ok=result.ok,
@@ -345,6 +357,7 @@ class Orchestrator:
                     self.log.warning("No-progress loop detected at step %d; aborting phase", step)
                     self._audit("no_progress_abort", step=step, tool=call.name, redundant=redundant)
                     self.emit("no_progress", step=step, tool=call.name, redundant=redundant)
+                    self._no_progress_abort = True
                     break
             else:
                 seen.add(sig)
@@ -353,6 +366,19 @@ class Orchestrator:
     async def _evaluation_step(self) -> None:
         # Run tests/compile off the event loop so a long suite doesn't block it.
         result = await asyncio.to_thread(self.evaluator.evaluate, self.workspace)
+        if result.passed and self._no_progress_abort and self._mutations == 0:
+            # The loop detector bailed and not one edit landed, yet the suite is
+            # green — because it was green before we started. That is a stalled
+            # run wearing a success's clothes; refuse to certify it.
+            result = replace(
+                result,
+                passed=False,
+                summary=(
+                    "Tests pass, but the agent stopped making progress without editing "
+                    "any file — the suite was already green before the task began, so "
+                    "it proves nothing here. Treating this as failure, not success."
+                ),
+            )
         style = "green" if result.passed else "red"
         console.print(Panel(result.summary, title="Evaluation", border_style=style))
         self.log.info("Evaluation passed=%s: %s", result.passed, result.summary)
