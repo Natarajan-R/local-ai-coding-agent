@@ -1,0 +1,156 @@
+[
+  {
+    "task": "Exercism_book-store",
+    "ok": false,
+    "error": "",
+    "raw_len": 2109,
+    "code_lines": 50
+  },
+  {
+    "task": "Exercism_bottle-song",
+    "ok": false,
+    "error": "",
+    "raw_len": 945,
+    "code_lines": 19
+  },
+  {
+    "task": "Exercism_bowling",
+    "ok": false,
+    "error": "",
+    "raw_len": 2760,
+    "code_lines": 62
+  },
+  {
+    "task": "Exercism_connect",
+    "ok": false,
+    "error": "",
+    "raw_len": 2340,
+    "code_lines": 56
+  },
+  {
+    "task": "Exercism_dot-dsl",
+    "ok": true,
+    "error": "",
+    "raw_len": 2020,
+    "code_lines": 62
+  },
+  {
+    "task": "Exercism_food-chain",
+    "ok": false,
+    "error": "",
+    "raw_len": 1416,
+    "code_lines": 33
+  },
+  {
+    "task": "Exercism_forth",
+    "ok": false,
+    "error": "",
+    "raw_len": 3369,
+    "code_lines": 86
+  },
+  {
+    "task": "Exercism_go-counting",
+    "ok": true,
+    "error": "",
+    "raw_len": 3145,
+    "code_lines": 93
+  },
+  {
+    "task": "Exercism_grep",
+    "ok": true,
+    "error": "",
+    "raw_len": 2819,
+    "code_lines": 79
+  },
+  {
+    "task": "Exercism_hangman",
+    "ok": true,
+    "error": "",
+    "raw_len": 1399,
+    "code_lines": 35
+  },
+  {
+    "task": "Exercism_poker",
+    "ok": false,
+    "error": "",
+    "raw_len": 1776,
+    "code_lines": 38
+  },
+  {
+    "task": "Exercism_pov",
+    "ok": false,
+    "error": "",
+    "raw_len": 2638,
+    "code_lines": 68
+  },
+  {
+    "task": "Exercism_react",
+    "ok": false,
+    "error": "",
+    "raw_len": 2173,
+    "code_lines": 55
+  },
+  {
+    "task": "Exercism_rest-api",
+    "ok": false,
+    "error": "",
+    "raw_len": 2615,
+    "code_lines": 68
+  },
+  {
+    "task": "Exercism_scale-generator",
+    "ok": false,
+    "error": "",
+    "raw_len": 1520,
+    "code_lines": 30
+  },
+  {
+    "task": "Exercism_sgf-parsing",
+    "ok": false,
+    "error": "",
+    "raw_len": 3409,
+    "code_lines": 105
+  },
+  {
+    "task": "Exercism_tree-building",
+    "ok": true,
+    "error": "",
+    "raw_len": 1609,
+    "code_lines": 40
+  },
+  {
+    "task": "Exercism_two-bucket",
+    "ok": false,
+    "error": "",
+    "raw_len": 1982,
+    "code_lines": 44
+  },
+  {
+    "task": "Exercism_variable-length-quantity",
+    "ok": false,
+    "error": "",
+    "raw_len": 1068,
+    "code_lines": 23
+  },
+  {
+    "task": "Exercism_wordy",
+    "ok": false,
+    "error": "",
+    "raw_len": 1676,
+    "code_lines": 48
+  },
+  {
+    "task": "Exercism_zebra-puzzle",
+    "ok": false,
+    "error": "",
+    "raw_len": 2528,
+    "code_lines": 49
+  },
+  {
+    "task": "Exercism_zipper",
+    "ok": false,
+    "error": "",
+    "raw_len": 2301,
+    "code_lines": 59
+  }
+]

@@ -1,0 +1,10 @@
+{
+  "instance_id": "requests__requests-mock-issue",
+  "repo": "psf/requests",
+  "base_commit": "v2.28.0",
+  "problem_statement": "Implement basic auth parsing in requests.auth.",
+  "hints_text": "",
+  "created_at": "2026-07-17T23:00:00Z",
+  "test_patch": "diff --git a/tests/test_auth.py b/tests/test_auth.py\nindex 1234567..89abcde 100\n--- a/tests/test_auth.py\n+++ b/tests/test_auth.py\n@@ -1,5 +1,9 @@\n def test_basic_auth_dummy():\n-    pass\n+    from requests.auth import HTTPBasicAuth\n+    auth = HTTPBasicAuth('user', 'pass')\n+    assert auth.username == 'user'\n+    assert auth.password == 'pass'\n",
+  "test_command": "pytest tests/test_auth.py"
+}

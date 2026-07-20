@@ -1,0 +1,12 @@
+beer-song
+dominoes
+grade-school
+list-ops
+paasio
+phone-number
+pig-latin
+robot-name
+simple-linked-list
+transpose
+affine-cipher
+proverb

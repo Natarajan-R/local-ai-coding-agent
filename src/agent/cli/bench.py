@@ -35,8 +35,67 @@ def _load_tasks() -> List[tuple[str, object]]:
     return tasks
 
 
-def run_benchmarks(workspace: Path, model: str) -> None:
+def run_benchmarks(workspace: Path, model: str, task_name: str | None = None, planner_editor: bool = False, max_retries: int = 2, num_ctx: int = 16384) -> None:
+    import fnmatch
     tasks = _load_tasks()
+    
+    # ONLY wins if non-empty: name exactly the tasks to run. Preferred over
+    # EXCLUDED, because an exclusion list silently runs everything you forgot to
+    # name -- on 2026-07-20 a 17-task Exercism list quietly pulled in all 164
+    # HumanEval tasks too, and it took ~40 wasted minutes to notice.
+    #
+    # Currently: the 6 that failed the 2026-07-20 17-task run, re-run to see how
+    # many the patcher double-indent fix (98404b1) recovers. phone-number is the
+    # direct test of that fix. Empty this set to fall back to EXCLUDED.
+    ONLY = {
+        "Exercism_hangman",
+        "Exercism_list-ops",
+        "Exercism_paasio",
+        "Exercism_phone-number",
+        "Exercism_transpose",
+        "Exercism_zebra-puzzle",
+    }
+
+    # Used only when ONLY is empty. 15 model-ceiling + 2 recoverable holdouts
+    # (go-counting is one Go-rule short; tree-building has tangled validation).
+    # bottle-song and zebra-puzzle are NOT here: aider passed them on the same
+    # 32B, so the ceiling list overcounted. See CAPABILITY_ENVELOPE.md.
+    EXCLUDED = {
+        "Exercism_book-store",
+        "Exercism_bowling",
+        "Exercism_connect",
+        "Exercism_food-chain",
+        "Exercism_forth",
+        "Exercism_poker",
+        "Exercism_pov",
+        "Exercism_react",
+        "Exercism_rest-api",
+        "Exercism_scale-generator",
+        "Exercism_sgf-parsing",
+        "Exercism_two-bucket",
+        "Exercism_variable-length-quantity",
+        "Exercism_wordy",
+        "Exercism_zipper",
+        "Exercism_go-counting",
+        "Exercism_tree-building",
+    }
+    if ONLY:
+        tasks = [t for t in tasks if t[0] in ONLY]
+        missing = ONLY - {t[0] for t in tasks}
+        if missing:
+            console.print(f"[red]ONLY names tasks that do not exist: {sorted(missing)}[/red]")
+            return
+    else:
+        tasks = [t for t in tasks if t[0].startswith("Exercism_") and t[0] not in EXCLUDED]
+
+    # Say out loud what is about to run, so a wrong list costs a second, not an hour.
+    console.print(f"[cyan]Running {len(tasks)} task(s):[/cyan] {', '.join(t[0] for t in tasks)}")
+
+    if task_name:
+        tasks = [t for t in tasks if fnmatch.fnmatch(t[0].lower(), task_name.lower())]
+        if not tasks:
+            console.print(f"[red]Task {task_name!r} not found.[/red]")
+            return
     if not tasks:
         console.print("[yellow]No benchmark tasks found.[/yellow]")
         return
@@ -51,16 +110,37 @@ def run_benchmarks(workspace: Path, model: str) -> None:
         for fname, content in getattr(module, "FILES", {}).items():
             (task_ws / fname).write_text(content, encoding="utf-8")
 
+        import os
+        import time
+        from agent.errors import TransientError
+        host = os.environ.get("AI_AGENT_HOST", "http://localhost:11434")
+        sandbox_backend = os.environ.get("AI_AGENT_SANDBOX", "auto")
         console.print(f"[bold]Running benchmark:[/bold] {name}")
-        orchestrator = Orchestrator(
-            workspace=task_ws, model_name=model, interactive=False
-        )
-        try:
-            asyncio.run(orchestrator.run_task(module.TASK, stream=False))
-            passed = bool(module.check(task_ws))
-        except Exception as exc:  # pragma: no cover - benchmark robustness
-            logger.error("Benchmark %s errored: %s", name, exc)
-            passed = False
+        
+        passed = False
+        for attempt in range(1, 4):
+            orchestrator = Orchestrator(
+                workspace=task_ws, model_name=model, interactive=False, planner_editor=planner_editor, max_retries=max_retries, host=host, sandbox_backend=sandbox_backend, num_ctx=num_ctx
+            )
+            try:
+                asyncio.run(orchestrator.run_task(module.TASK, stream=False))
+                passed = bool(module.check(task_ws))
+                break
+            except TransientError as exc:
+                if attempt < 3:
+                    # Must outlast a tunnel reconnect, or a dropped SSH session
+                    # burns all 3 attempts against a dead socket and the task is
+                    # scored a FAIL that has nothing to do with the model.
+                    # autossh reconnects in ~10s (ServerAliveInterval 5 x 2).
+                    console.print(f"[yellow]Transient infrastructure error on attempt {attempt}: {exc}. Retrying in 60 seconds...[/yellow]")
+                    time.sleep(60)
+                else:
+                    logger.error("Benchmark %s failed after 3 infrastructure retries: %s", name, exc)
+                    passed = False
+            except Exception as exc:  # pragma: no cover - benchmark robustness
+                logger.error("Benchmark %s errored: %s", name, exc)
+                passed = False
+                break
 
         table.add_row(name, "[green]PASS[/green]" if passed else "[red]FAIL[/red]")
 

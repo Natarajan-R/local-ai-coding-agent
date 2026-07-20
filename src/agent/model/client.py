@@ -39,7 +39,7 @@ class OllamaClient:
     ) -> None:
         self.model_name = model_name
         self.host = host.rstrip("/")
-        self.options = options or {"temperature": 0.1, "num_ctx": 8192}
+        self.options = options or {"temperature": 0.1, "num_ctx": 16384}
         if client is not None:
             self._client = client
         else:
@@ -76,10 +76,12 @@ class OllamaClient:
         if tools:
             payload["tools"] = tools
 
+        logger.debug("Ollama chat request: %s", json.dumps(payload))
         try:
             resp = await self._client.post(f"{self.host}/api/chat", json=payload)
             resp.raise_for_status()
             data = resp.json()
+            logger.debug("Ollama chat response: %s", json.dumps(data))
         except httpx.HTTPError as exc:
             raise ModelError(f"Ollama chat request failed: {exc}") from exc
         except json.JSONDecodeError as exc:
@@ -113,6 +115,7 @@ class OllamaClient:
         if tools:
             payload["tools"] = tools
 
+        logger.debug("Ollama stream chat request: %s", json.dumps(payload))
         content_parts: List[str] = []
         tool_calls: List[Dict[str, Any]] = []
         final_raw: Dict[str, Any] = {}
@@ -140,7 +143,10 @@ class OllamaClient:
         except httpx.HTTPError as exc:
             raise ModelError(f"Ollama stream request failed: {exc}") from exc
 
-        return ChatResponse("".join(content_parts), tool_calls, final_raw)
+        res = ChatResponse("".join(content_parts), tool_calls, final_raw)
+        logger.debug("Ollama stream chat response complete. content=%r tool_calls=%r raw=%s",
+                     res.content, res.tool_calls, json.dumps(res.raw))
+        return res
 
     async def generate_stream(self, messages: List[Dict[str, Any]]) -> AsyncIterator[str]:
         """Yield content tokens as they arrive from a streaming chat request."""
@@ -150,6 +156,7 @@ class OllamaClient:
             "stream": True,
             "options": self.options,
         }
+        logger.debug("Ollama generate stream request: %s", json.dumps(payload))
         try:
             async with self._client.stream("POST", f"{self.host}/api/chat", json=payload) as resp:
                 resp.raise_for_status()
@@ -164,6 +171,7 @@ class OllamaClient:
                     if token:
                         yield token
                     if chunk.get("done"):
+                        logger.debug("Ollama generate stream done: %s", json.dumps(chunk))
                         break
         except httpx.HTTPError as exc:
             raise ModelError(f"Ollama stream request failed: {exc}") from exc

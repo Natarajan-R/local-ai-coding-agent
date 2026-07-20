@@ -21,8 +21,20 @@ htmlcov/
 # Agent runtime artifacts
 logs/
 workspace/
+workspace_*/
 .ai-agent/
 *.log
+
+# ...but the curated benchmark logs are the point: they are the published
+# evidence for the numbers in benchmarks/results/README.md. Without this
+# exception `*.log` above silently drops them and the results folder publishes
+# as a README making claims with nothing to back them.
+!benchmarks/results/
+!benchmarks/results/*.log
+
+# Two-task smoke runs used to validate the harness itself -- no interpretive
+# value to a reader, and they invite "what is this?" next to the real results.
+benchmarks/aider_tool_validate*.json
 
 # Editor / OS
 .idea/

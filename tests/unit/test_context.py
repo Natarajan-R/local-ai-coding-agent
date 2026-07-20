@@ -60,3 +60,26 @@ def test_hard_truncate_when_head_and_tail_too_big():
 def test_budget_floor():
     cm = ContextManager(max_tokens=100, response_reserve=1000)
     assert cm.budget == 512  # never goes below the floor
+
+
+def test_pins_memories_and_lessons_learned():
+    cm = ContextManager(max_tokens=400, response_reserve=100, keep_recent=1)
+    big = "y" * 4000
+    msgs = [
+        _msg("system", "SYSTEM RULES"),
+        _msg("user", "PRIMER: task description"),
+        _msg("user", "# Project memory (facts learned in previous runs — honor these):\n1. Do X"),
+        _msg("user", "Lesson from a previous attempt: Do Y"),
+        _msg("user", "The change failed evaluation. Lesson: Do Z"),
+        _msg("assistant", big + " old_step"),
+        _msg("assistant", "RECENT assistant"),
+    ]
+    result = cm.fit(msgs)
+    assert result.trimmed is True
+    
+    contents = [m["content"] for m in result.messages]
+    assert any("Project memory (facts learned" in c for c in contents)
+    assert any("Lesson from a previous attempt:" in c for c in contents)
+    assert any("The change failed evaluation." in c for c in contents)
+    assert not any("old_step" in c for c in contents)
+

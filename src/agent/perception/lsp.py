@@ -141,6 +141,7 @@ class LSPClient:
             "params": params,
         }
         body = json.dumps(payload).encode("utf-8")
+        logger.debug("LSP sent request: %s", json.dumps(payload))
         headers = f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8")
         self._proc.stdin.write(headers + body)
         await self._proc.stdin.drain()
@@ -148,7 +149,9 @@ class LSPClient:
         # Bound every request so a wedged server can never hang the caller
         # (initialize/shutdown included).
         try:
-            return await asyncio.wait_for(fut, timeout=timeout)
+            res = await asyncio.wait_for(fut, timeout=timeout)
+            logger.debug("LSP request %d response: %r", req_id, res)
+            return res
         finally:
             self._pending_requests.pop(req_id, None)
 
@@ -161,6 +164,7 @@ class LSPClient:
             "params": params,
         }
         body = json.dumps(payload).encode("utf-8")
+        logger.debug("LSP sent notification: %s", json.dumps(payload))
         headers = f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8")
         self._proc.stdin.write(headers + body)
         await self._proc.stdin.drain()
@@ -218,6 +222,7 @@ class LSPClient:
 
                 body_bytes = await self._proc.stdout.readexactly(content_length)
                 body = json.loads(body_bytes.decode("utf-8"))
+                logger.debug("LSP received message: %s", json.dumps(body))
 
                 if "id" in body:
                     # Request Response
@@ -348,6 +353,24 @@ class LSPClient:
             return []
         return res or []
 
+    async def rename(self, path: Path, line: int, character: int, new_name: str) -> Optional[Dict[str, Any]]:
+        """Query rename edits for a symbol (0-indexed line and character)."""
+        if not await self._wait_ready():
+            return None
+        uri = Path(path).resolve().as_uri()
+        params = {
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": character},
+            "newName": new_name,
+        }
+        try:
+            return await asyncio.wait_for(
+                self._send_request("textDocument/rename", params), timeout=REQUEST_TIMEOUT
+            )
+        except Exception as exc:
+            logger.warning("LSP rename request failed: %s", exc)
+            return None
+
     def get_all_diagnostics(self) -> str:
         """Compile a clean human-readable list of current project diagnostics."""
         lines = []
@@ -477,6 +500,12 @@ class LSPManager:
     async def get_references(self, path: Path, line: int, character: int) -> List[Dict[str, Any]]:
         client, _ = await self._client_for(path)
         return await client.get_references(path, line, character) if client is not None else []
+
+    async def rename(self, path: Path, line: int, character: int, new_name: str) -> Optional[Dict[str, Any]]:
+        client, _ = await self._client_for(path)
+        if client is not None:
+            return await client.rename(path, line, character, new_name)
+        return None
 
     async def await_diagnostics(self, timeout: float = 5.0) -> bool:
         """Wait for every pooled server to answer. Same contract as the single client."""

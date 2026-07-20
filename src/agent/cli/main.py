@@ -67,6 +67,7 @@ def run(
     ),
     log_level: str = typer.Option("INFO", "--log-level", envvar="AI_AGENT_LOG_LEVEL"),
     json_logs: bool = typer.Option(False, "--json-logs", help="Write logs/agent.log as JSON lines"),
+    planner_editor: bool = typer.Option(False, "--planner-editor", help="Enable the Planner/Editor architecture instead of generic loop"),
 ) -> None:
     """Run the agent on a single task.
 
@@ -93,6 +94,7 @@ def run(
         num_ctx=num_ctx,
         use_memory=memory,
         escalation_callback=_console_hint if interactive else None,
+        planner_editor=planner_editor,
     )
 
     try:
@@ -121,11 +123,16 @@ def run(
 def bench(
     workspace: Path = typer.Option(Path("workspace"), "--workspace", "-w"),
     model: str = typer.Option("qwen2.5:7b", "--model", "-m"),
+    task: Optional[str] = typer.Option(None, "--task", "-t", help="Run a single task by name"),
+    planner_editor: bool = typer.Option(False, "--planner-editor", help="Enable Planner/Editor mode for benchmarks"),
+    max_retries: int = typer.Option(2, "--max-retries", help="Max reflexion retry budget"),
+    num_ctx: int = typer.Option(16384, "--num-ctx", envvar="AI_AGENT_NUM_CTX", help="Model context window size"),
 ) -> None:
     """Run the bundled benchmark tasks (see benchmarks/tasks)."""
     from agent.cli.bench import run_benchmarks
 
-    run_benchmarks(workspace=workspace, model=model)
+    setup_logging(log_level="INFO")
+    run_benchmarks(workspace=workspace, model=model, task_name=task, planner_editor=planner_editor, max_retries=max_retries, num_ctx=num_ctx)
 
 
 @app.command()
@@ -144,6 +151,7 @@ def serve(
     auth: bool = typer.Option(True, "--auth/--no-auth",
                               help="Require a session token to connect (recommended)"),
     log_level: str = typer.Option("INFO", "--log-level", envvar="AI_AGENT_LOG_LEVEL"),
+    planner_editor: bool = typer.Option(False, "--planner-editor", help="Enable Planner/Editor mode"),
 ) -> None:
     """Launch the web dashboard: submit tasks and watch the agent run live."""
     setup_logging(log_level=log_level)
@@ -165,7 +173,7 @@ def serve(
         workspace=workspace, model=model, host=host, sandbox_backend=sandbox,
         interactive=interactive, max_steps=max_steps, max_retries=max_retries,
         num_ctx=num_ctx, test_command=test_command, log_dir=Path("logs"),
-        require_auth=auth,
+        require_auth=auth, planner_editor=planner_editor,
     )
     # serve() resolves a free port and prints the tokened URL to open.
     serve_app(config, bind=bind, port=port)

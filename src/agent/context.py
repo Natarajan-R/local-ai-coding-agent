@@ -64,6 +64,18 @@ class ContextManager:
     def total_tokens(self, messages: List[Dict]) -> int:
         return sum(self._msg_tokens(m) for m in messages)
 
+    def _is_pinned(self, idx: int, msg: Dict, first_non_sys_idx: int) -> bool:
+        if idx <= first_non_sys_idx:
+            return True
+        content = str(msg.get("content", ""))
+        if content.startswith("# Project memory (facts learned"):
+            return True
+        if content.startswith("Lesson from a previous attempt:"):
+            return True
+        if content.startswith("The change failed evaluation."):
+            return True
+        return False
+
     # -- fitting -------------------------------------------------------------
     def fit(self, messages: List[Dict]) -> TrimResult:
         """Return a copy of ``messages`` trimmed to fit the token budget."""
@@ -73,44 +85,50 @@ class ContextManager:
 
         n = len(messages)
 
-        # Head: leading system messages + the first message after them (the
-        # task/plan primer). These are never dropped.
-        head_end = 0
-        while head_end < n and messages[head_end].get("role") == "system":
-            head_end += 1
-        if head_end < n:
-            head_end += 1
-        head = messages[:head_end]
+        # Identify the first user/assistant/tool message (first non-system message)
+        first_non_sys_idx = 0
+        while first_non_sys_idx < n and messages[first_non_sys_idx].get("role") == "system":
+            first_non_sys_idx += 1
 
         # Tail: the most recent turns, always kept.
-        tail_start = max(head_end, n - self.keep_recent)
-        tail = messages[tail_start:]
-        middle = list(messages[head_end:tail_start])
+        tail_start = max(first_non_sys_idx + 1, n - self.keep_recent)
 
-        # Drop oldest middle messages until head + middle + tail fit.
-        dropped = 0
+        # Candidates for dropping: messages before tail_start that are not pinned
+        candidates = []
+        for i in range(n):
+            if i < tail_start and not self._is_pinned(i, messages[i], first_non_sys_idx):
+                candidates.append(i)
+
+        dropped_indices = set()
+        current_tokens = total
         marker_tokens = 20
-        while middle and (
-            self.total_tokens(head) + self.total_tokens(middle)
-            + self.total_tokens(tail) + marker_tokens > self.budget
-        ):
-            middle.pop(0)
-            dropped += 1
 
-        rebuilt: List[Dict] = list(head)
-        if dropped:
-            rebuilt.append({
-                "role": "user",
-                "content": f"[... {dropped} earlier step(s) omitted to fit the context window ...]",
-            })
-        rebuilt.extend(middle)
-        rebuilt.extend(tail)
+        # Drop oldest candidates first
+        for idx in candidates:
+            if current_tokens + (marker_tokens if not dropped_indices else 0) <= self.budget:
+                break
+            current_tokens -= self._msg_tokens(messages[idx])
+            dropped_indices.add(idx)
 
-        # Last resort: head + tail alone still too big -> shrink largest contents.
+        # Rebuild messages list
+        rebuilt = []
+        has_dropped = False
+        for i in range(n):
+            if i in dropped_indices:
+                if not has_dropped:
+                    rebuilt.append({
+                        "role": "user",
+                        "content": f"[... {len(dropped_indices)} earlier step(s) omitted to fit the context window ...]",
+                    })
+                    has_dropped = True
+                continue
+            rebuilt.append(messages[i])
+
+        # Last resort: if still too big, apply hard truncate on rebuilt list
         if self.total_tokens(rebuilt) > self.budget:
             rebuilt = self._hard_truncate(rebuilt)
 
-        return TrimResult(rebuilt, True, dropped, self.total_tokens(rebuilt))
+        return TrimResult(rebuilt, True, len(dropped_indices), self.total_tokens(rebuilt))
 
     def _hard_truncate(self, messages: List[Dict]) -> List[Dict]:
         """Shrink the largest contents until they fit, sparing the system prompt.

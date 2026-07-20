@@ -1,0 +1,172 @@
+[
+  {
+    "task": "Exercism_pov",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_grep",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_forth",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_poker",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_react",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_wordy",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_paasio",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_zipper",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_bowling",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_connect",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_dot-dsl",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_hangman",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_proverb",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_dominoes",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_list-ops",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_rest-api",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_beer-song",
+    "ok": false,
+    "error": "timeout"
+  },
+  {
+    "task": "Exercism_pig-latin",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_transpose",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_book-store",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_food-chain",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_robot-name",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_two-bucket",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_bottle-song",
+    "ok": false,
+    "error": "timeout"
+  },
+  {
+    "task": "Exercism_go-counting",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_sgf-parsing",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_grade-school",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_phone-number",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_zebra-puzzle",
+    "ok": true,
+    "error": ""
+  },
+  {
+    "task": "Exercism_affine-cipher",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_tree-building",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_scale-generator",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_simple-linked-list",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_variable-length-quantity",
+    "ok": false,
+    "error": ""
+  }
+]

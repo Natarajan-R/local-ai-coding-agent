@@ -58,3 +58,94 @@ def test_evaluator_handles_test_file_with_no_tests(local_sandbox, policy, worksp
     ev = Evaluator(local_sandbox, policy)
     result = ev.evaluate(workspace)
     assert result.passed
+
+
+def test_evaluator_syntax_check_fails_when_no_edits(local_sandbox, policy, workspace):
+    import subprocess
+    subprocess.run(["git", "init"], cwd=str(workspace), check=True)
+    subprocess.run(["git", "config", "user.email", "agent@test.com"], cwd=str(workspace), check=True)
+    subprocess.run(["git", "config", "user.name", "Agent Test"], cwd=str(workspace), check=True)
+    
+    (workspace / "ok.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "ok.py"], cwd=str(workspace), check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=str(workspace), check=True)
+    
+    ev = Evaluator(local_sandbox, policy)
+    result = ev.evaluate(workspace)
+    assert not result.passed
+    assert "no edits/mutations made" in result.summary
+
+
+def test_evaluator_syntax_check_passes_with_edits(local_sandbox, policy, workspace):
+    import subprocess
+    subprocess.run(["git", "init"], cwd=str(workspace), check=True)
+    subprocess.run(["git", "config", "user.email", "agent@test.com"], cwd=str(workspace), check=True)
+    subprocess.run(["git", "config", "user.name", "Agent Test"], cwd=str(workspace), check=True)
+    
+    (workspace / "ok.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "ok.py"], cwd=str(workspace), check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=str(workspace), check=True)
+    
+    # Make a change
+    (workspace / "ok.py").write_text("x = 2\n")
+    
+    ev = Evaluator(local_sandbox, policy)
+    result = ev.evaluate(workspace)
+    assert result.passed
+    assert "sources compile cleanly" in result.summary
+
+
+
+# --- enhancements-03 #3: condense failed-test output so the traceback survives --
+from agent.evaluation.evaluator import _condense_test_output
+
+# A realistic pytest run: lots of passing noise, then the FAILURES section with the
+# actual `E  assert ...` detail, then the short summary. The condenser must KEEP the
+# assertion detail (which the crude "only FAILED/AssertionError/Error: lines" filter
+# in the proposal would DROP) and drop the passing noise.
+_PYTEST_OUTPUT = """\
+============================= test session starts ==============================
+collected 40 items
+
+test_x.py ......................................F.                        [100%]
+
+=================================== FAILURES ===================================
+_________________________________ test_thirty _________________________________
+
+    def test_thirty():
+>       assert candidate(1) == 2
+E       assert 1 == 2
+E        +  where 1 = candidate(1)
+
+test_x.py:57: AssertionError
+=========================== short test summary info ============================
+FAILED test_x.py::test_thirty - assert 1 == 2
+========================= 1 failed, 39 passed in 0.42s =========================
+"""
+
+
+def test_condense_keeps_assertion_detail_and_drops_passing_noise():
+    out = _condense_test_output(_PYTEST_OUTPUT)
+    # the diagnostic that tells the model WHAT failed must survive:
+    assert "assert 1 == 2" in out
+    assert "where 1 = candidate(1)" in out
+    assert "FAILED test_x.py::test_thirty" in out
+    # the passing-noise header must be gone:
+    assert "test session starts" not in out
+    assert "collected 40 items" not in out
+
+
+def test_condense_keeps_tail_when_capping():
+    # a huge run: the summary lives at the END, so capping must keep the tail.
+    big = "=================================== FAILURES ===================================\n"
+    big += "\n".join(f"noise line {i}" for i in range(5000))
+    big += "\nE       assert 1 == 2\nFAILED test_x.py::test_last - assert 1 == 2\n"
+    out = _condense_test_output(big, limit=500)
+    assert "assert 1 == 2" in out          # tail preserved
+    assert "FAILED test_x.py::test_last" in out
+    assert len(out) < 700                    # actually capped
+
+
+def test_condense_falls_back_for_non_pytest_output():
+    out = _condense_test_output("Traceback (most recent call last):\n  File x\nValueError: boom")
+    assert "ValueError: boom" in out

@@ -57,6 +57,7 @@ async def test_stall_after_real_edits_still_passes(workspace):
     orch = Orchestrator(
         workspace=workspace, interactive=False, sandbox_backend="local", max_retries=0
     )
+    orch.stop_when_green = False
     fake = FakeModel(
         plan="1. Rename user_id to uuid",
         exec_responses=[
@@ -72,3 +73,46 @@ async def test_stall_after_real_edits_still_passes(workspace):
     assert orch._mutations == 2
     assert orch._no_progress_abort is True
     assert orch.fsm.state == AgentState.DONE
+
+
+async def test_diagnostic_feedback_loop_blocks_finish(workspace):
+    class MockClient:
+        def __init__(self):
+            self.diagnostics = {"file:///main.py": [{"severity": 1, "message": "syntax error"}]}
+
+    class MockLSPManager:
+        def __init__(self):
+            self.diagnostics_return = "error: syntax error in main.py line 3"
+            self._clients = {"mock": MockClient()}
+        async def start(self):
+            pass
+        async def stop(self):
+            pass
+        async def await_diagnostics(self, timeout=2.0):
+            pass
+        def get_all_diagnostics(self):
+            return self.diagnostics_return
+
+    orch = Orchestrator(workspace=workspace, interactive=False, sandbox_backend="local", max_retries=0)
+    orch.lsp = MockLSPManager()
+
+    fake = FakeModel(
+        plan="1. Finish",
+        exec_responses=[_tool_call("finish", summary="done")] * 5,
+    )
+    _install_fake(orch, fake)
+
+    await orch.run_task("Do something", stream=False)
+
+    assert orch.fsm.state != AgentState.DONE
+    any_error_msg = any(
+        "There are compile/lint errors in the workspace" in msg.get("content", "")
+        for msg in orch.frame.messages if msg.get("role") == "user"
+    )
+    assert any_error_msg
+    any_diag_text = any(
+        "error: syntax error in main.py line 3" in msg.get("content", "")
+        for msg in orch.frame.messages if msg.get("role") == "user"
+    )
+    assert any_diag_text
+

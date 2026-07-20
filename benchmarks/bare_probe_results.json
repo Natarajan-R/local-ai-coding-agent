@@ -1,0 +1,62 @@
+[
+  {
+    "task": "Exercism_beer-song",
+    "ok": true,
+    "error": ""
+  },
+  {
+    "task": "Exercism_dominoes",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_grade-school",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_list-ops",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_paasio",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_phone-number",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_pig-latin",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_robot-name",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_simple-linked-list",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_transpose",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_affine-cipher",
+    "ok": false,
+    "error": ""
+  },
+  {
+    "task": "Exercism_proverb",
+    "ok": false,
+    "error": ""
+  }
+]

@@ -108,3 +108,41 @@ def test_unescaped_fallback_still_refuses_ambiguity():
     content = 'a = x["id"]\nb = x["id"]\n'
     with pytest.raises(ToolError):
         apply_search_replace(content, 'x\\["id"\\]', 'x\\["uuid"\\]')
+
+
+def test_fuzzy_line_edit_does_not_double_indent():
+    """Regression: the fuzzy fallback stacked two indents and broke the file.
+
+    Found 2026-07-20 on Exercism_phone-number. The model's search block wrapped
+    a call across lines differently from the file, so no line-normalized match
+    existed and apply_line_edit fell through to the character-level fuzzy path.
+    There, _clean_str strips whitespace -- so start_char_idx pointed at the first
+    non-blank character and splicing at it KEPT the line's existing indent, while
+    align_indentation had already applied its own. 8 spaces became 16 and the
+    module stopped importing, which reads as a total model failure.
+
+    Same shape as the align_indentation double-count, in a second code path.
+    """
+    from agent.tools.patcher import apply_line_edit
+    import ast
+
+    content = (
+        "class PhoneNumber:\n"
+        "    def __init__(self, number):\n"
+        '        cleaned = re.sub(r"[^0-9]", "", number)\n'
+        '        if len(cleaned) == 11 and cleaned[0] == "1":\n'
+        "            cleaned = cleaned[1:]\n"
+    )
+    # Wrapped differently from the file -> forces the fuzzy path.
+    search = 'cleaned = re.sub(r"[^0-9]",\n "", number)\n'
+    replace = (
+        'cleaned = re.sub(r"[^0-9]", "", number)\n'
+        "        if len(cleaned) < 10:\n"
+        '            raise ValueError("short")\n'
+    )
+
+    out = apply_line_edit(content, 3, 3, search, replace)
+
+    ast.parse(out)  # the actual bug: this raised IndentationError
+    assert '                cleaned = re.sub' not in out, "indent applied twice"
+    assert '        cleaned = re.sub(r"[^0-9]", "", number)\n' in out

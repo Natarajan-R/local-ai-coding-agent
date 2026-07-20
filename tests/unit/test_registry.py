@@ -218,3 +218,225 @@ async def test_lsp_tools_dispatch(local_sandbox, policy, workspace):
 
     res = await reg.execute("get_diagnostics", {})
     assert res.ok
+
+
+# --- rename_symbol ----------------------------------------------------------
+# `search_replace` handles one site; `replace_all` handles one file. Neither
+# handles the case that actually breaks a repository: a rename spanning many
+# files, where every file you miss is a broken import. Measured on tenacity
+# (124 occurrences, 13 files): without this tool the agent renamed the
+# definition in __init__.py, left the other 12 files, and broke the package —
+# 0/4. With it: 4/4, in 4-6 tool calls.
+
+
+async def test_rename_symbol_spans_files(registry, workspace):
+    (workspace / "a.py").write_text("class Foo:\n    pass\n")
+    (workspace / "b.py").write_text("from a import Foo\n\nx = Foo()\n")
+    (workspace / "pkg").mkdir()
+    (workspace / "pkg" / "c.py").write_text("from a import Foo\ny = Foo\n")
+
+    res = await registry.execute("rename_symbol", {"old": "Foo", "new": "Bar"})
+    assert res.ok
+    assert "5 occurrence(s) across 3 file(s)" in res.content
+    assert "Foo" not in (workspace / "a.py").read_text()
+    assert "Bar" in (workspace / "b.py").read_text()
+    assert "Bar" in (workspace / "pkg" / "c.py").read_text()
+
+
+async def test_rename_symbol_matches_whole_words_only(registry, workspace):
+    # The reason this is not `replace_all` across files: a substring rename would
+    # corrupt every one of these.
+    (workspace / "a.py").write_text("Foo = 1\nFooBar = 2\nmy_foo = 3\nBarFoo = 4\nfooed = 5\n")
+    res = await registry.execute("rename_symbol", {"old": "Foo", "new": "Baz"})
+    assert res.ok
+    text = (workspace / "a.py").read_text()
+    assert "Baz = 1" in text
+    assert "FooBar = 2" in text      # untouched
+    assert "BarFoo = 4" in text      # untouched
+    assert "my_foo = 3" in text      # untouched
+
+
+async def test_rename_symbol_skips_ignored_dirs(registry, workspace):
+    (workspace / "a.py").write_text("Foo = 1\n")
+    (workspace / ".venv").mkdir()
+    (workspace / ".venv" / "lib.py").write_text("Foo = 'third-party, not ours'\n")
+    res = await registry.execute("rename_symbol", {"old": "Foo", "new": "Bar"})
+    assert res.ok
+    assert "Foo" in (workspace / ".venv" / "lib.py").read_text()
+    assert "1 file(s)" in res.content
+
+
+async def test_rename_symbol_reports_when_absent(registry, workspace):
+    (workspace / "a.py").write_text("x = 1\n")
+    res = await registry.execute("rename_symbol", {"old": "Nope", "new": "Bar"})
+    assert not res.ok
+    assert "not a regex" in res.content
+
+
+async def test_rename_symbol_rejects_noop(registry, workspace):
+    (workspace / "a.py").write_text("Foo = 1\n")
+    res = await registry.execute("rename_symbol", {"old": "Foo", "new": "Foo"})
+    assert not res.ok
+
+
+# --- add_docstring ----------------------------------------------------------
+# Once the parser stopped dropping docstring edits the agent reached 5/7, and
+# the rest of the failures were syntax errors: inserting a docstring with
+# search_replace means reproducing the def line and inventing the body's
+# indentation. This tool takes a symbol and prose and lets the AST decide.
+
+DOC_SRC = (
+    "import math\n\n\ndef area(r):\n    return math.pi * r * r\n\n\n"
+    "class Shape:\n    def __init__(self, name):\n        self.name = name\n\n"
+    "    def describe(self):\n        return self.name\n"
+)
+
+
+async def test_add_docstring_function_and_method(registry, workspace):
+    (workspace / "s.py").write_text(DOC_SRC)
+    res = await registry.execute("add_docstring", {
+        "path": "s.py", "symbol": "area",
+        "docstring": "Return the area.\n\nArgs:\n    r (float): The radius.",
+    })
+    assert res.ok
+    res = await registry.execute("add_docstring", {
+        "path": "s.py", "symbol": "Shape.describe", "docstring": "Return the name.",
+    })
+    assert res.ok
+
+    import ast
+    tree = ast.parse((workspace / "s.py").read_text())   # must still parse
+    fn = next(n for n in tree.body if getattr(n, "name", None) == "area")
+    assert "Return the area." in ast.get_docstring(fn)
+    cls = next(n for n in tree.body if getattr(n, "name", None) == "Shape")
+    meth = next(n for n in cls.body if getattr(n, "name", None) == "describe")
+    assert ast.get_docstring(meth) == "Return the name."
+
+
+async def test_add_docstring_replaces_an_existing_one(registry, workspace):
+    (workspace / "s.py").write_text('def f():\n    """Old."""\n    return 1\n')
+    res = await registry.execute("add_docstring", {
+        "path": "s.py", "symbol": "f", "docstring": "New.",
+    })
+    assert res.ok and "Replaced" in res.content
+    import ast
+    assert ast.get_docstring(ast.parse((workspace / "s.py").read_text()).body[0]) == "New."
+
+
+async def test_add_docstring_reports_what_is_left(registry, workspace):
+    # The model can see the methods (outline lists them) and stops early anyway.
+    # A prompt saying "be thorough" measures zero; the tool reporting the
+    # remaining work took this from 5/7 to 7/7.
+    (workspace / "s.py").write_text(DOC_SRC)
+    res = await registry.execute("add_docstring", {
+        "path": "s.py", "symbol": "area", "docstring": "Area.",
+    })
+    assert res.ok
+    assert "Still undocumented" in res.content
+    assert "Shape.__init__" in res.content and "Shape.describe" in res.content
+
+
+async def test_add_docstring_unknown_symbol_lists_the_real_ones(registry, workspace):
+    (workspace / "s.py").write_text(DOC_SRC)
+    res = await registry.execute("add_docstring", {
+        "path": "s.py", "symbol": "nope", "docstring": "x",
+    })
+    assert not res.ok
+    assert "area" in res.content and "Shape" in res.content
+
+
+async def test_add_docstring_refuses_a_file_that_does_not_parse(registry, workspace):
+    (workspace / "bad.py").write_text("def f(:\n    pass\n")
+    res = await registry.execute("add_docstring", {
+        "path": "bad.py", "symbol": "f", "docstring": "x",
+    })
+    assert not res.ok
+
+
+# --- read_symbol ------------------------------------------------------------
+# find_symbol answers "where" (a path:line) and never "what", and could not
+# express "the constructor OF THIS CLASS". Asked to change
+# RetryCallState.__init__, the model grepped `def __init__`, got every
+# constructor in the file, and edited the wrong class's — breaking 144 tests
+# without ever reading a line. Given a name it cannot address, a model guesses.
+
+
+async def test_read_symbol_addresses_a_method_of_a_class(registry, workspace):
+    (workspace / "m.py").write_text(
+        "class A:\n    def __init__(self, x):\n        self.x = x\n\n"
+        "class B:\n    def __init__(self, y):\n        self.y = y\n"
+    )
+    res = await registry.execute("read_symbol", {"symbol": "B.__init__"})
+    assert res.ok
+    assert "self.y = y" in res.content      # B's constructor...
+    assert "self.x = x" not in res.content  # ...and not A's
+
+
+async def test_read_symbol_finds_across_the_workspace(registry, workspace):
+    (workspace / "pkg").mkdir()
+    (workspace / "pkg" / "deep.py").write_text("def buried():\n    return 42\n")
+    res = await registry.execute("read_symbol", {"symbol": "buried"})
+    assert res.ok
+    assert "return 42" in res.content
+    assert "deep.py" in res.content
+
+
+async def test_read_symbol_reports_a_miss_usefully(registry, workspace):
+    (workspace / "m.py").write_text("def a():\n    pass\n")
+    res = await registry.execute("read_symbol", {"symbol": "nope"})
+    assert not res.ok
+    assert "Class.method" in res.content
+
+
+async def test_write_file_normalizes_async_scaffolding(registry, workspace):
+    res = await registry.execute("write_file", {
+        "path": "test_async.py",
+        "content": "async async async def foo():\n    pass\n"
+    })
+    assert res.ok
+    content = (workspace / "test_async.py").read_text()
+    assert content.strip() == "async def foo():\n    pass"
+
+
+async def test_search_replace_normalizes_async_scaffolding(registry, workspace):
+    (workspace / "test_async_sr.py").write_text("x = 1\n")
+    res = await registry.execute("search_replace", {
+        "path": "test_async_sr.py",
+        "search": "x = 1",
+        "replace": "async async def foo():\n    pass\n"
+    })
+    assert res.ok
+    content = (workspace / "test_async_sr.py").read_text()
+    assert content.strip() == "async def foo():\n    pass"
+
+
+
+# --- safe_unescape: preserve string-literal escapes inside code ---------------
+# enhancements-03.md #1 proposed "always convert \n->newline, \t->tab, ignore
+# quote state". That patch is WRONG: it turns board.split('\n') into
+# board.split('<newline>') -> SyntaxError: unterminated string literal -- the
+# exact failure it claimed to fix. The quote-tracking (commit c4df84a) is correct.
+# These tests guard the correct behaviour against that bad patch.
+import ast as _ast
+from agent.tools.registry import safe_unescape as _safe_unescape
+
+
+def test_safe_unescape_keeps_literal_newline_inside_code_string():
+    # structural \n becomes a real line break; the '\n' INSIDE the code stays a
+    # 2-char escape so the resulting Python is valid.
+    out = _safe_unescape("def f(board):\\n    return board.split('\\n')")
+    _ast.parse(out)  # must be valid Python (would raise under the #1 patch)
+    assert "return board.split('\\n')" in out
+    assert out.startswith("def f(board):\n")
+
+
+def test_safe_unescape_keeps_literal_newline_in_one_liner():
+    out = _safe_unescape("x = '\\n'.join(items)")
+    _ast.parse(out)
+    assert out == "x = '\\n'.join(items)"   # unchanged — it's already one line of code
+
+
+def test_safe_unescape_converts_structural_tab_indent():
+    out = _safe_unescape("def f():\\n\\tif x:\\n\\t\\treturn 1")
+    _ast.parse(out)
+    assert "\tif x:" in out and "\t\treturn 1" in out

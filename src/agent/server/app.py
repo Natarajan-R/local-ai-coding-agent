@@ -35,6 +35,7 @@ class ServerConfig:
     test_command: Optional[str] = None
     log_dir: Optional[Path] = None
     require_auth: bool = True                   # gate /ws with a per-session token
+    planner_editor: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -57,6 +58,7 @@ class AgentServer:
         self.approvals = ApprovalBroker(self.broadcaster)
         self.hints = HintBroker(self.broadcaster)
         self._running = False
+        self._orchestrator = None
         # Per-session token that the browser must present to open the WebSocket.
         self.token = uuid.uuid4().hex if config.require_auth else None
 
@@ -140,6 +142,15 @@ class AgentServer:
             self.approvals.resolve(str(data.get("id", "")), bool(data.get("approved")))
         elif kind == "hint":
             self.hints.resolve(str(data.get("id", "")), data.get("hint"))
+        elif kind == "pause":
+            if self._orchestrator:
+                self._orchestrator.pause()
+        elif kind == "resume":
+            if self._orchestrator:
+                self._orchestrator.resume()
+        elif kind == "stop":
+            if self._orchestrator:
+                self._orchestrator.stop()
 
     async def _start_run(self, task: str, options: Dict[str, Any]) -> None:
         if self._running:
@@ -156,7 +167,7 @@ class AgentServer:
         interactive = bool(options.get("interactive", cfg.interactive))
         model = options.get("model") or cfg.model
         try:
-            orchestrator = Orchestrator(
+            self._orchestrator = Orchestrator(
                 workspace=cfg.workspace,
                 model_name=model,
                 host=cfg.host,
@@ -170,12 +181,14 @@ class AgentServer:
                 event_sink=self.broadcaster.publish,
                 approval_callback=self.approvals.request if interactive else None,
                 escalation_callback=self.hints.request if interactive else None,
+                planner_editor=cfg.planner_editor,
             )
-            await orchestrator.run_task(task, stream=True)
+            await self._orchestrator.run_task(task, stream=True)
         except Exception as exc:  # pragma: no cover - defensive top-level
             logger.exception("Run failed")
             self.broadcaster.publish({"event": "error", "message": str(exc)})
         finally:
+            self._orchestrator = None
             self._running = False
 
 
