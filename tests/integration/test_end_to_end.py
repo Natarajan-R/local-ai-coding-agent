@@ -265,3 +265,51 @@ async def test_real_model_smoke(workspace):
     await orch.run_task("Create a file hello.py that prints Hello, World!", stream=False)
     # We don't assert on model quality, only that the loop terminates cleanly.
     assert orch.fsm.is_terminal()
+
+
+async def test_verification_reruns_are_not_treated_as_no_progress(workspace):
+    """Re-running the tests after each new file is progress, not a loop.
+
+    The detector keyed purely on (tool, args), so the write/test/write/test
+    rhythm of multi-file work tripped it: an identical `run_command` was counted
+    redundant even though a file had been created in between. That aborted the
+    execution phase in roughly one scaffolding run in three, and the resulting
+    projects were missing files nobody had decided to skip.
+    """
+    orch = Orchestrator(workspace=workspace, interactive=False,
+                        sandbox_backend="local", max_retries=0)
+    # write a, test, write b, test, write c, test, ... then finish
+    responses = []
+    for name in ("a", "b", "c", "d"):
+        responses.append(_tool_call("write_file", path=f"{name}.py", content=f"# {name}\n"))
+        responses.append(_tool_call("run_command", command="python -m pytest -q"))
+    responses.append(_tool_call("finish", summary="done"))
+
+    fake = FakeModel(plan="1. scaffold", exec_responses=responses)
+    _install_fake(orch, fake)
+
+    await orch.run_task("Create four files, testing after each", stream=False)
+
+    # Every file must exist: an abort would have cut the sequence short.
+    for name in ("a", "b", "c", "d"):
+        assert (workspace / f"{name}.py").exists(), f"{name}.py missing - phase aborted early"
+    assert orch._no_progress_abort is False, "identical test reruns wrongly flagged as a stall"
+
+
+async def test_repeated_identical_write_still_breaks(workspace):
+    """The exemption must not let an edit tool excuse itself.
+
+    A mutating call bumps the mutation counter by being executed, so keying the
+    exemption on "did the workspace move" alone would make an infinite
+    write_file loop permanently exempt. Only verification tools are exempt.
+    """
+    orch = Orchestrator(workspace=workspace, interactive=False,
+                        sandbox_backend="local", max_retries=0)
+    same_call = _tool_call("write_file", path="loop.py", content="x = 1\n")
+    fake = FakeModel(plan="1. loop", exec_responses=[same_call])
+    _install_fake(orch, fake)
+
+    await orch.run_task("Write loop.py", stream=False)
+
+    assert orch.fsm.is_terminal()
+    assert orch._no_progress_abort is True, "identical repeated writes must still stall out"

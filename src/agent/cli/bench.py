@@ -44,23 +44,21 @@ def run_benchmarks(workspace: Path, model: str, task_name: str | None = None, pl
     # name -- on 2026-07-20 a 17-task Exercism list quietly pulled in all 164
     # HumanEval tasks too, and it took ~40 wasted minutes to notice.
     #
-    # Currently: the 6 that failed the 2026-07-20 17-task run, re-run to see how
-    # many the patcher double-indent fix (98404b1) recovers. phone-number is the
-    # direct test of that fix. Empty this set to fall back to EXCLUDED.
-    ONLY = {
-        "Exercism_hangman",
-        "Exercism_list-ops",
-        "Exercism_paasio",
-        "Exercism_phone-number",
-        "Exercism_transpose",
-        "Exercism_zebra-puzzle",
-    }
+    # Empty = fall back to EXCLUDED (the full runnable set). Populate it only for
+    # a targeted experiment, and empty it again afterwards -- a stale ONLY
+    # silently measures last week's question.
+    ONLY: set[str] = set()
 
     # Used only when ONLY is empty. 15 model-ceiling + 2 recoverable holdouts
     # (go-counting is one Go-rule short; tree-building has tangled validation).
     # bottle-song and zebra-puzzle are NOT here: aider passed them on the same
     # 32B, so the ceiling list overcounted. See CAPABILITY_ENVELOPE.md.
     EXCLUDED = {
+        # Unpassable: check() runs a file with no tests and demands exit 0,
+        # but pytest exits 5 on "no tests collected". Every run has scored it a
+        # failure, for this agent and aider alike, so the real denominator is 33
+        # not 34. See the note at the top of benchmarks/tasks/Exercism_paasio.py.
+        "Exercism_paasio",
         "Exercism_book-store",
         "Exercism_bowling",
         "Exercism_connect",

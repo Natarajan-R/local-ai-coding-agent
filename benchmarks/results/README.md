@@ -20,24 +20,32 @@ runs pytest independently rather than trusting either tool's self-report.
 
 `aider_humaneval_iter.{json,log}`
 
-### Exercism — 34 multi-file tasks, `qwen2.5-coder:32b`, 16k context
+### Exercism — 33 runnable multi-file tasks, `qwen2.5-coder:32b`, 16k context
 
-| Tool | Passed | |
+| Tool | Single run | Union of runs |
 | --- | --- | --- |
-| this agent | 12 / 34 single run, 15 / 34 union of runs | 35–44% |
-| aider 0.86.2 | 3 / 34 | 8.8% |
+| this agent | 12 / 33 | 16 / 33 |
+| aider 0.86.2 | 1–3 / 33 | 4 / 33 |
+
+aider was run twice (300s and 900s per-task timeouts). **The two runs share no
+passes at all** — 3/34 then 1/34, four distinct tasks, none passing twice. Its
+result is a range, not a point, exactly like this agent's. Compare single-run to
+single-run, or union to union; both give roughly a 4x gap.
+
+Denominator is 33, not 34: `Exercism_paasio` is unpassable (caveat 7). The raw
+logs below show 34 rows, `paasio` among them, because they predate that finding.
 
 `aider_exercism_32b.{json,log}`
 
 This is the comparison worth quoting: same model, same 16k context, same tasks,
 same scorer, neither tool choosing the task list.
 
-### Exercism — 17-task subset, `qwen2.5-coder:32b`, 16k context
+### Exercism — 16-task subset, `qwen2.5-coder:32b`, 16k context
 
 | Tool | Passed |
 | --- | --- |
-| this agent | 11 / 17 |
-| aider 0.86.2 | 3 / 17 |
+| this agent | 11 / 16 |
+| aider 0.86.2 | 3 / 16 |
 
 `agent_exercism_17_32b.log`. **Do not read this as a 3.7x result** — see caveat 1.
 
@@ -46,16 +54,17 @@ same scorer, neither tool choosing the task list.
 These matter more than the numbers, and are listed because a benchmark without
 them is marketing.
 
-1. **The 17-task subset is selection-biased toward this agent.** Those tasks were
+1. **The 16-task subset is selection-biased toward this agent.** Those tasks were
    chosen *because this agent had passed 15 of them* in an earlier run. aider was
    never going to look good on a set picked that way. The unbiased comparison is
-   the full 34.
+   the full 33.
 
-2. **aider ran under two handicaps we imposed.** A 300s per-task timeout (5 of the
-   34 tasks hit it and were scored failures) and `--map-tokens 0`, which disables
-   its repo-map feature. Neither limit applied to this agent. A fairer aider run
-   would use `--timeout 900` and leave the repo map on; that has not been done, so
-   treat 3/34 as a floor for aider rather than its ceiling.
+2. **aider ran under two handicaps we imposed — one has now been tested.** The
+   300s per-task timeout was removed in a second run at 900s
+   (`aider_exercism_32b_t900.{json,log}`). It did **not** help: passes went 3 -> 1
+   and timeouts only 5 -> 3, so the timeout was not what limited aider. The other
+   handicap stands: `--map-tokens 0` disables its repo-map feature, and that has
+   not been retested.
 
 3. **aider beat this agent on `zebra-puzzle`** — a constraint solver this agent
    fails. It also passed `bottle-song`, which we had wrongly classified as beyond
@@ -67,8 +76,8 @@ them is marketing.
    same-week measurement, so it is not a like-for-like pairing with aider's 125/164
    and is quoted as a range on purpose.
 
-5. **Single-run vs union.** This agent's Exercism results are stochastic: 12/34 on
-   one run, 15/34 as the union across runs. aider's 3/34 is a single run. Compare
+5. **Single-run vs union.** This agent's Exercism results are stochastic: 12/33 on
+   one run, 16/33 as the union across runs. aider's 3/33 is a single run. Compare
    single-run to single-run when it matters.
 
 6. **An earlier 7B Exercism run is included but not comparable.** In
@@ -77,6 +86,16 @@ them is marketing.
    truncates past its window. That was our bug in the harness, not aider's. It is
    published for completeness and should not be cited. The 32B run above was
    re-done with both sides pinned to 16k.
+
+7. **One task in the set is impossible, and we did not notice for weeks.**
+   `Exercism_paasio`'s `check()` writes a file containing only mock helper
+   classes, runs pytest on it, and requires exit code 0 — but pytest exits 5 on
+   "no tests collected". No solution can pass it, including a correct one. It was
+   scored a failure in every run, for this agent and for aider equally, so the
+   comparison was never skewed — but the denominator was wrong. It is excluded
+   rather than repaired: writing the exercise's tests ourselves would mean
+   inventing the specification, and a benchmark whose tests we authored proves
+   less than one we did not.
 
 ## What the failures were
 

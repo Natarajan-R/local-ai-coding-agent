@@ -631,7 +631,12 @@ class Orchestrator:
         if self._is_single_file_workspace():
             exclude_names = {"rename_symbol", "add_parameter", "add_docstring"}
             tools = [t for t in tools if t.get("function", {}).get("name") not in exclude_names]
-        seen: set[tuple] = set()   # every tool-call signature performed this phase
+        # signature -> self._mutations when it was last performed. Not a set:
+        # repeating an action is only evidence of wandering if NOTHING changed
+        # since last time. Re-running the test command after each new file is
+        # correct behaviour, and treating it as a loop aborted multi-file work
+        # roughly one run in three.
+        seen: dict[tuple, int] = {}
         redundant = 0              # count of repeated (already-performed) actions
         for step in range(1, self.max_steps + 1):
             if self._stopped:
@@ -728,7 +733,17 @@ class Orchestrator:
             # progress even though consecutive calls differ. Repeating any prior
             # action is the signal; nudge on each repeat and bail after a few.
             sig = (call.name, repr(sorted(call.arguments.items())))
-            if sig in seen:
+            last_mutations = seen.get(sig)
+            # A repeat of a *verification* action is only no-progress if the
+            # workspace has not moved since -- re-running the tests after each
+            # new file is correct, and calling that a loop aborted multi-file
+            # work about one run in three. The exemption is limited to
+            # non-mutating tools on purpose: an edit tool repeating identical
+            # arguments bumps _mutations itself and would exempt itself forever.
+            VERIFY_TOOLS = {"run_command", "get_diagnostics", "read_file",
+                            "list_files", "outline", "search_text", "read_symbol"}
+            moved = (call.name in VERIFY_TOOLS and last_mutations != self._mutations)
+            if last_mutations is not None and not moved:
                 redundant += 1
                 self.log.info("Redundant repeat of %s (x%d) at step %d", call.name, redundant, step)
                 self.frame.messages.append({
@@ -748,7 +763,7 @@ class Orchestrator:
                     self._no_progress_abort = True
                     break
             else:
-                seen.add(sig)
+                seen[sig] = self._mutations
 
             if result.is_final:
                 if self.lsp:

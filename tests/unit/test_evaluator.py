@@ -149,3 +149,113 @@ def test_condense_keeps_tail_when_capping():
 def test_condense_falls_back_for_non_pytest_output():
     out = _condense_test_output("Traceback (most recent call last):\n  File x\nValueError: boom")
     assert "ValueError: boom" in out
+
+
+# --- _extract_failures ------------------------------------------------------
+# This builds the failure summary handed to EVERY reflexion. If it silently
+# stops matching some pytest output shape, the model loses its diagnostic
+# evidence and you see only vague reflexions and unexplained failures -- so the
+# shapes it must handle are pinned here.
+
+from agent.evaluation.evaluator import _extract_failures, _condense_test_output
+
+
+PYTEST_FAILURE = """============================= test session starts ==============================
+collected 21 items
+
+phone_number_test.py .FF                                                 [100%]
+
+=================================== FAILURES ===================================
+_____________ PhoneNumberTest.test_invalid_if_area_code_starts_with_0 __________
+self = <phone_number_test.PhoneNumberTest testMethod=test_invalid>
+
+    def test_invalid_if_area_code_starts_with_0(self):
+>       self.assertEqual(err.exception.args[0], "area code cannot start with zero")
+phone_number_test.py:91: AssertionError
+E       AssertionError: 'punctuations not permitted' != 'area code cannot start with zero'
+_____________ PhoneNumberTest.test_cleans_the_number ___________________________
+phone_number.py:8: ValueError
+E           ValueError: punctuations not permitted
+=========================== short test summary info ============================
+FAILED phone_number_test.py::PhoneNumberTest::test_invalid_if_area_code_starts_with_0
+2 failed, 19 passed in 0.08s
+"""
+
+
+def test_extract_failures_pulls_test_name_location_and_assertion():
+    out = _extract_failures(PYTEST_FAILURE)
+    assert "FAILURES SUMMARY" in out
+    assert "test_invalid_if_area_code_starts_with_0" in out
+    assert "phone_number_test.py:91" in out          # LOCATION
+    # the decisive line: what was raised vs what was expected
+    assert "'punctuations not permitted' != 'area code cannot start with zero'" in out
+
+
+def test_extract_failures_reports_every_failing_test():
+    out = _extract_failures(PYTEST_FAILURE)
+    assert out.count("FAILED TEST:") == 2
+    assert "test_cleans_the_number" in out
+
+
+def test_extract_failures_is_empty_when_nothing_failed():
+    passing = "collected 3 items\n\ntest_x.py ...   [100%]\n\n3 passed in 0.01s\n"
+    assert _extract_failures(passing) == ""
+    assert _extract_failures("") == ""
+
+
+def test_extract_failures_handles_collection_errors():
+    """A file that will not import is reported under ERRORS, not FAILURES.
+
+    That is the case where feedback matters most -- every test fails at import
+    and the model otherwise gets no idea why. The first version only looked for
+    a FAILURES banner and returned nothing here.
+    """
+    collection_error = """=================================== ERRORS ====================================
+_______________ ERROR collecting phone_number_test.py _________________________
+phone_number.py:6: unexpected indent
+E   IndentationError: unexpected indent
+=========================== short test summary info ============================
+ERROR phone_number_test.py
+"""
+    out = _extract_failures(collection_error)
+    assert "IndentationError" in out, "collection errors must reach the model"
+    assert "phone_number.py:6" in out
+
+
+def test_condense_keeps_diagnostics_even_if_extraction_finds_nothing():
+    """Belt and braces: the raw failure text must survive regardless."""
+    weird = "some non-pytest runner output\nAssertionError: boom\n"
+    assert "AssertionError" in _condense_test_output(weird)
+
+
+REAL_COLLECTION_ERROR = """
+==================================== ERRORS ====================================
+_ ERROR collecting bench/Exercism_hangman/hangman_test.py __
+ImportError while importing test module '/abs/bench/Exercism_hangman/hangman_test.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.12/importlib/__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+bench/Exercism_hangman/hangman_test.py:3: in <module>
+    import hangman
+bench/Exercism_hangman/hangman.py:7: in <module>
+    from reactive import Var, Cell
+E   ModuleNotFoundError: No module named 'reactive'
+=========================== short test summary info ============================
+ERROR bench/Exercism_hangman/hangman_test.py
+"""
+
+
+def test_extract_failures_handles_real_pytest_separator_widths():
+    """Captured from an actual run, not hand-written.
+
+    pytest pads its separators to the terminal width, so a collection error can
+    arrive as "_ ERROR collecting foo.py __" with a single leading underscore.
+    An earlier version required three and returned an empty summary -- and the
+    first test written for this used an invented sample that happened to have
+    three, so it passed while real output did not work.
+    """
+    out = _extract_failures(REAL_COLLECTION_ERROR)
+    assert out, "real collection-error output must produce a summary"
+    assert "ModuleNotFoundError: No module named 'reactive'" in out
+    assert "hangman.py:7" in out, "must point at the offending line"

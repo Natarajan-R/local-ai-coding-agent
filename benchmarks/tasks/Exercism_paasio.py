@@ -1,4 +1,18 @@
-"""Exercism task Exercism_paasio"""
+"""Exercism task Exercism_paasio.
+
+BROKEN -- THIS TASK CAN NEVER PASS. Verified 2026-07-20.
+
+check() writes test_utils.py, which contains only mock helper classes and no
+tests, then runs pytest on it and requires returncode == 0. pytest exits 5
+("no tests collected"), so check() returns False for every possible solution,
+including a perfect one. It has been scored a failure in every run to date, for
+this agent and for aider alike.
+
+It is excluded in agent.cli.bench rather than repaired: writing the real
+exercise's test suite here would mean inventing the specification, and a
+benchmark whose tests we authored ourselves proves less than one we did not.
+Fix upstream by importing the genuine paasio_test.py from the Exercism track.
+"""
 from pathlib import Path
 
 TASK = """Implement the solution defined in paasio.py. Make the tests pass.

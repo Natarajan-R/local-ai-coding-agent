@@ -36,7 +36,11 @@ def _extract_failures(output: str) -> str:
     in_failures = False
     
     for line in lines:
-        if "FAILURES" in line and line.startswith("="):
+        # ERRORS as well as FAILURES: a module that will not import is reported
+        # under an ERRORS banner, and that is precisely when the model most
+        # needs to be told why -- every test failed at collection, so without
+        # this it gets a summary with nothing in it.
+        if line.startswith("=") and ("FAILURES" in line or "ERRORS" in line):
             in_failures = True
             continue
         if in_failures and line.startswith("="):
@@ -46,7 +50,18 @@ def _extract_failures(output: str) -> str:
                 in_failures = False
                 
         if in_failures:
-            if line.startswith("___") and line.endswith("___"):
+            # pytest pads these separators to the terminal width, so a collection
+            # error can arrive as "_ ERROR collecting foo.py __" -- requiring
+            # three leading underscores missed it and produced an empty summary
+            # for the very failures that stop a module importing.
+            stripped = line.strip()
+            is_separator = (
+                len(stripped) > 4
+                and stripped.startswith("_")
+                and stripped.endswith("_")
+                and stripped.strip("_ ") != ""
+            )
+            if is_separator:
                 if current_test:
                     failures.append((current_test, "\n".join(current_error), current_file_line))
                 current_test = line.strip("_ ")
