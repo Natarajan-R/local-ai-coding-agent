@@ -776,13 +776,95 @@ class Orchestrator:
                         result.ok = False
                         result.content = f"Blocked finish: compiler diagnostics reported errors:\n{diagnostics_text}"
                         continue
+
+                # Blocking finish here, not only at evaluation, is the point.
+                # Evaluation alone caught the omission but could not repair it:
+                # reflexion correctly diagnosed "create the missing __init__.py
+                # files", handed that lesson back, and the executor called finish
+                # again immediately -- because the suite was green and green is
+                # its finish criterion. Three retries burned without a single
+                # write. The executor has to be stopped where it tries to leave.
+                missing = self._missing_requested_files()
+                if missing:
+                    console.print(f"[yellow]Blocked finish: {len(missing)} requested file(s) missing[/yellow]")
+                    self.frame.messages.append({
+                        "role": "user",
+                        "content": (
+                            "Wait, you cannot finish yet. The task asked for these files "
+                            "and they do not exist:\n"
+                            + "\n".join(f"  - {m}" for m in missing)
+                            + "\nCreate each one with write_file now. An empty file is fine "
+                              "for __init__.py. The tests already pass, so do not change any "
+                              "existing code -- only add the missing files, then call finish."
+                        )
+                    })
+                    result.is_final = False
+                    result.ok = False
+                    result.content = "Blocked finish: missing requested files: " + ", ".join(missing)
+                    continue
                 self.frame.metadata["finish_summary"] = result.content
                 break
         self.fsm.transition("execution_done")
 
+    def _missing_requested_files(self) -> list[str]:
+        """Files the task named explicitly that were never created.
+
+        A green suite does not mean the task was done. Asked for 11 files across
+        nested packages, the agent delivered 8, declared success, and pytest
+        agreed -- because PEP 420 namespace packages import fine without
+        __init__.py, so the three missing ones were invisible until packaging
+        broke far away from the cause. Tests check behaviour; nothing checked
+        that what was asked for actually exists.
+
+        Deliberately conservative: only paths that look like real files (a slash
+        or a known source suffix) and that the task states outright. A task that
+        names no files yields no findings.
+        """
+        import re
+        text = getattr(self.frame, "task_description", "") or ""
+        # Strip URLs first: the tokenizer below splits on ':', so a bare
+        # "http" prefix check never sees "//example.com/guide.py" and would
+        # report a documentation link as a missing file.
+        text = re.sub(r"\w+://\S+|\bwww\.\S+", " ", text)
+        SUFFIXES = (".py", ".js", ".ts", ".go", ".rs", ".java", ".rb", ".c", ".h",
+                    ".cpp", ".json", ".yaml", ".yml", ".toml", ".md", ".txt", ".cfg")
+        candidates = set()
+        for token in re.findall(r"[\w./-]+", text):
+            token = token.strip(".,;:")
+            if not token.endswith(SUFFIXES):
+                continue
+            if "/" not in token and not token.endswith(".py"):
+                continue          # a bare "notes.md" is usually prose, not a path
+            if token.startswith(("/", "..")) or ".." in token:
+                continue
+            candidates.add(token)
+        missing = []
+        for rel in sorted(candidates):
+            try:
+                if not (self.workspace / rel).exists():
+                    missing.append(rel)
+            except (OSError, ValueError):
+                continue
+        return missing
+
     async def _evaluation_step(self) -> None:
         # Run tests/compile off the event loop so a long suite doesn't block it.
         result = await asyncio.to_thread(self.evaluator.evaluate, self.workspace)
+        if result.passed:
+            missing = self._missing_requested_files()
+            if missing:
+                # Name them, and say what to do -- a bare "incomplete" sends the
+                # model rewriting code that was already correct.
+                result = replace(
+                    result,
+                    passed=False,
+                    summary=(
+                        "Tests pass, but the task asked for files that do not exist: "
+                        + ", ".join(missing)
+                        + ". Create exactly these files. Do not modify the code that "
+                        "is already passing."
+                    ),
+                )
         if result.passed and self._no_progress_abort and self._mutations == 0:
             # The loop detector bailed and not one edit landed, yet the suite is
             # green — because it was green before we started. That is a stalled

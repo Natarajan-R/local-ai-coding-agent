@@ -328,6 +328,45 @@ class ToolRegistry:
             self._read_file,
         ))
         self.register(Tool(
+            "solve_constraints",
+            "Solve a constraint or optimisation problem exactly, using a real solver "
+            "(z3). Use this instead of reasoning it out by hand whenever the answer "
+            "requires search over combinations: scheduling and timetabling, resource "
+            "or shift allocation, picking dependency versions that satisfy ranges, "
+            "checking whether a configuration is even possible, or maximising a value "
+            "under limits. Declare each variable (type int/real/bool, with min/max or "
+            "an explicit domain list), then give constraints as ordinary expressions, "
+            "e.g. 'start_b >= start_a + 3' or 'x + y <= 10'. Returns a concrete "
+            "assignment, or tells you the constraints conflict -- which is a real "
+            "answer, not a failure. Do NOT hand-solve a problem you can state here.",
+            {
+                "type": "object",
+                "properties": {
+                    "variables": {
+                        "type": "array",
+                        "description": "Variables to solve for. Each: {name, type: int|real|bool, "
+                                       "and optionally min, max, or domain: [allowed values]}",
+                        "items": {"type": "object"},
+                    },
+                    "constraints": {
+                        "type": "array",
+                        "description": "Expressions that must all hold, e.g. ['x + y == 10', 'x > y']. "
+                                       "Use variables, numbers, + - * / % **, comparisons, and/or/not.",
+                        "items": {"type": "string"},
+                    },
+                    "all_different": {
+                        "type": "array",
+                        "description": "Names of variables that must all take different values",
+                        "items": {"type": "string"},
+                    },
+                    "minimize": {"type": "string", "description": "Expression to minimise (optional)"},
+                    "maximize": {"type": "string", "description": "Expression to maximise (optional)"},
+                },
+                "required": ["variables", "constraints"],
+            },
+            self._solve_constraints,
+        ))
+        self.register(Tool(
             "write_file",
             "Create or overwrite a file in the workspace with the given content.",
             {
@@ -658,6 +697,38 @@ class ToolRegistry:
         if not self.policy.validate_path(path):
             raise ToolError(f"Path '{path}' is outside the workspace")
         return self.policy.resolve_path(path)
+
+    async def _solve_constraints(
+        self,
+        variables: Any,
+        constraints: Any,
+        all_different: Any = None,
+        minimize: Optional[str] = None,
+        maximize: Optional[str] = None,
+    ) -> ToolResult:
+        from .solver import solve, SolverError
+        try:
+            solution = await asyncio.to_thread(
+                solve, variables, constraints, all_different, minimize, maximize
+            )
+        except SolverError as exc:
+            # State the fix, not just the fault -- a bare error sends the model
+            # round the loop re-sending the same malformed problem.
+            return ToolResult(False, f"Could not solve: {exc}")
+        except Exception as exc:  # pragma: no cover - solver robustness
+            return ToolResult(False, f"Solver failed: {type(exc).__name__}: {exc}")
+
+        if solution.status == "sat":
+            lines = "\n".join(f"  {k} = {v}" for k, v in sorted(solution.assignments.items()))
+            return ToolResult(True, f"Solved. Use these values:\n{lines}")
+        if solution.status == "unsat":
+            return ToolResult(
+                True,
+                "No solution exists -- these constraints contradict each other. "
+                "This is a definite answer: do not retry the same problem. Relax or "
+                "correct a constraint, or report that the requirement is impossible.",
+            )
+        return ToolResult(False, solution.message)
 
     async def _read_file(
         self, path: str, start_line: Optional[int] = None, end_line: Optional[int] = None

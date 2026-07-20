@@ -18,6 +18,7 @@ ALL_TOOL_DESCRIPTIONS = {
     "find_importers": "find_importers(name): Find which files import a module/symbol (impact analysis).",
     "remember": "remember(text, kind): Save a durable fact for FUTURE runs (a project convention, a lesson learned, or a preference). Use sparingly, only for facts that will help next time.",
     "run_command": "run_command(command): Run a shell command in the sandbox.",
+    "solve_constraints": "solve_constraints(variables, constraints, all_different?, minimize?, maximize?): Solve scheduling/allocation/version-choice exactly via a solver. Variables: {name, type: int|real|bool, min?, max?, domain?}; constraints like 'b >= a + 3'.",
     "find_definition": "find_definition(path, line, character): Find definition of a symbol (0-indexed line and character).",
     "find_references": "find_references(path, line, character): Find references to a symbol (0-indexed line and character).",
     "get_diagnostics": "get_diagnostics(): Get current compiler/linting diagnostics in the workspace.",

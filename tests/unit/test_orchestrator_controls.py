@@ -95,3 +95,53 @@ async def test_orchestrator_pause_resume_control(workspace):
 
     assert orch._paused is False
     assert orch.fsm.state == AgentState.DONE
+
+
+def test_missing_requested_files_catches_silently_skipped_files(tmp_path):
+    """A green suite is not proof the task was done.
+
+    Found 2026-07-20: asked for 11 files across nested packages, the agent wrote
+    8, called finish, and pytest passed -- PEP 420 namespace packages import
+    fine without __init__.py, so the three missing ones stayed invisible until
+    packaging would break far from the cause.
+    """
+    from agent.orchestrator import Orchestrator
+    from agent.state import AgentFrame
+
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("")
+    (tmp_path / "pkg" / "core").mkdir()
+    (tmp_path / "pkg" / "core" / "note.py").write_text("x = 1\n")
+
+    o = Orchestrator.__new__(Orchestrator)
+    o.workspace = tmp_path
+    # A real AgentFrame, not a MagicMock: a mock invents any attribute you ask
+    # for, which is exactly how the first version of this shipped reading a
+    # frame.task that does not exist.
+    o.frame = AgentFrame(task_description=(
+        "Build pkg/__init__.py; pkg/core/__init__.py; "
+        "pkg/core/note.py; tests/test_note.py"))
+
+    missing = o._missing_requested_files()
+    assert "pkg/core/__init__.py" in missing
+    assert "tests/test_note.py" in missing
+    assert "pkg/__init__.py" not in missing     # exists
+    assert "pkg/core/note.py" not in missing    # exists
+
+
+def test_missing_requested_files_is_quiet_when_no_files_named(tmp_path):
+    """Must not invent findings from prose, or every refactor task fails."""
+    from agent.orchestrator import Orchestrator
+    from agent.state import AgentFrame
+
+    o = Orchestrator.__new__(Orchestrator)
+    o.workspace = tmp_path
+    o.frame = AgentFrame(task_description="")
+
+    for prose in [
+        "Refactor the code to be faster and add better error handling.",
+        "Rename user_id to account_id everywhere.",
+        "Read the docs at https://example.com/guide.py and improve things.",
+    ]:
+        o.frame.task_description = prose
+        assert o._missing_requested_files() == [], prose

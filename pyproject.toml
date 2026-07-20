@@ -21,6 +21,13 @@ dependencies = [
 web = [
     "aiohttp>=3.9",
 ]
+# Optional: solve_constraints degrades with an install hint when z3 is absent.
+# Kept optional deliberately -- in testing the model solved scheduling, rostering
+# and knapsack problems by writing and running its own code rather than calling
+# this tool, so it is unproven in practice and should not be a required install.
+solver = [
+    "z3-solver>=4.12",
+]
 security = [
     "bashlex>=0.18",
 ]
