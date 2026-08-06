@@ -8,6 +8,21 @@ and reflects on failures — all driven by a local model served by
 > **New here? Start with the [User Guide](USER_GUIDE.md)** — install, first run,
 > commands, recipes, the web UI, and troubleshooting.
 
+> ### 🔖 Book readers, please read this
+> `main` has moved **beyond the book.** Since publication the agent gained a
+> multi-agent architecture, stronger evaluation/reflexion, and many fixes — this
+> branch is the **latest working version**, and it no longer matches the book's
+> prose file-for-file.
+>
+> **For code that matches the book exactly, use the [`book-edition`](../../releases/tag/book-edition) tag:**
+> ```bash
+> git clone https://github.com/Natarajan-R/local-ai-coding-agent.git
+> cd local-ai-coding-agent
+> git checkout book-edition     # the exact code the book walks through
+> ```
+> Stay on `main` for the newest, most capable code. The book remains the guided
+> tour of *why* the architecture is shaped this way.
+
 ---
 
 ## 📖 Companion to the book

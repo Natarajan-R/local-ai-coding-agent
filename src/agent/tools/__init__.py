@@ -1,7 +1,8 @@
 """Agent tools: parsing model output and executing tool calls."""
 from .parser import ToolCall, ToolParser
 from .patcher import apply_search_replace, make_diff
-from .registry import Tool, ToolRegistry, ToolResult
+from .registry import ToolRegistry
+from .utils import Tool, ToolResult
 
 __all__ = [
     "ToolCall",

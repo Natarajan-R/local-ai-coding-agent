@@ -20,6 +20,8 @@ _PATTERNS: List[Tuple[str, "re.Pattern[str]"]] = [
 
 @dataclass
 class SecretFinding:
+    """One detected secret: its kind, matched text, and span in the source."""
+
     kind: str
     match: str
     start: int
@@ -30,6 +32,7 @@ class SecretsScanner:
     """Find and redact secrets in arbitrary text (tool output, diffs, ...)."""
 
     def scan(self, text: str) -> List[SecretFinding]:
+        """Return every secret matched in ``text`` (empty list if none)."""
         findings: List[SecretFinding] = []
         if not text:
             return findings
@@ -39,9 +42,11 @@ class SecretsScanner:
         return findings
 
     def has_secrets(self, text: str) -> bool:
+        """Return True if ``text`` contains at least one detectable secret."""
         return bool(self.scan(text))
 
     def redact(self, text: str, placeholder: str = "[REDACTED]") -> str:
+        """Replace every matched secret in ``text`` with ``placeholder``."""
         if not text:
             return text
         redacted = text

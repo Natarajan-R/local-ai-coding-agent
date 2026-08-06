@@ -1,5 +1,4 @@
 import pytest
-from pathlib import Path
 from agent.orchestrator import Orchestrator
 from agent.evaluation.evaluator import Evaluator
 from unittest.mock import MagicMock
@@ -63,16 +62,21 @@ def test_extract_implicit_code_invalid_bare(workspace):
 def test_evaluator_initial_test_files(local_sandbox, policy, workspace):
     # Pre-existing test file
     (workspace / "test_calc.py").write_text("def test_calc(): pass")
-    
+
     # Evaluator should track and run it
     ev = Evaluator(local_sandbox, policy, initial_test_files=["test_calc.py"])
     assert ev._has_python_tests(workspace) is True
-    assert ev._detect_command(workspace) == "python -m pytest -q"
-    
-    # If no initial test files, should ignore model-created tests
+    assert ev._detect_command(workspace).startswith("PYTHONPATH=. python -m pytest -q")
+
+    # REVERSED deliberately. This used to assert that a run starting with no tests
+    # must ignore tests the model creates, so it could not grade its own homework.
+    # The effect was the opposite of the intent: on a greenfield task detection
+    # returned None and evaluation fell back to a compile check that passes, so the
+    # run went green with nothing verified at all. Running a self-authored test is
+    # strictly more informative; self-authorship is surfaced in the summary instead.
     ev_empty = Evaluator(local_sandbox, policy, initial_test_files=[])
-    assert ev_empty._has_python_tests(workspace) is False
-    assert ev_empty._detect_command(workspace) is None
+    assert ev_empty._has_python_tests(workspace) is True
+    assert ev_empty._detect_command(workspace).startswith("PYTHONPATH=. python -m pytest -q")
 
 def test_evaluator_tamper_proofing(local_sandbox, policy, workspace):
     # Pre-existing test file
@@ -121,7 +125,7 @@ async def test_stop_when_green_guard(workspace):
     from agent.fsm import AgentState
     orch.fsm.state = AgentState.EXECUTING
     orch.max_steps = 5
-    await orch._execution_step()
+    await orch.coder_agent.execute()
     
     # Verify that evaluate was called
     orch.evaluator.evaluate.assert_called_once()
@@ -159,7 +163,7 @@ async def test_scoping_semantic_tools_in_single_file_workspace(workspace):
     from agent.fsm import AgentState
     orch.fsm.state = AgentState.EXECUTING
     orch.max_steps = 1
-    await orch._execution_step()
+    await orch.coder_agent.execute()
     
     # Verify the last message is a tool result containing the block error message
     last_msg = orch.frame.messages[-1]
@@ -167,3 +171,70 @@ async def test_scoping_semantic_tools_in_single_file_workspace(workspace):
     assert "not available in a single-file workspace" in last_msg["content"]
 
 
+
+
+def test_parse_pytest_tally_extracts_counts_and_failing_ids():
+    """The eval-delta parser must surface passed/failed counts and failing test ids."""
+    from agent.evaluation.evaluator import _parse_pytest_tally
+
+    out = ("FAILED tests/test_a.py::test_one\nFAILED tests/test_b.py::test_two\n"
+           "6 failed, 15 passed in 0.13s")
+    passed, failed, skipped, failing = _parse_pytest_tally(out)
+    assert (passed, failed, skipped) == (15, 6, 0)
+    assert failing == ["tests/test_a.py::test_one", "tests/test_b.py::test_two"]
+
+    # Collection/execution errors count as failures (nothing was verified).
+    assert _parse_pytest_tally("2 errors in 0.20s")[1] == 2
+    # All green.
+    assert _parse_pytest_tally("..... 5 passed in 0.04s") == (5, 0, 0, [])
+    # Skipped tests are captured (green-by-skipping must be visible).
+    assert _parse_pytest_tally("9 passed, 3 skipped in 0.05s") == (9, 0, 3, [])
+    # Non-pytest / empty output degrades to zeros, never raises.
+    assert _parse_pytest_tally("") == (0, 0, 0, [])
+
+
+def test_evaluate_populates_structured_tally(local_sandbox, policy, workspace):
+    """evaluate() must fill EvalResult.tests_passed/failed/failing_tests from pytest output."""
+    (workspace / "solution.py").write_text("def add(a, b):\n    return a - b\n")  # deliberate bug
+    (workspace / "test_solution.py").write_text(
+        "from solution import add\n\n\ndef test_add():\n    assert add(2, 3) == 5\n"
+    )
+    ev = Evaluator(local_sandbox, policy, initial_test_files=[])
+    result = ev.evaluate(workspace)
+    assert result.passed is False
+    assert result.tests_failed >= 1
+    assert any("test_add" in t for t in result.failing_tests)
+
+
+def test_parse_pytest_tally_ignores_spurious_failed_in_traceback():
+    """The count must come from the summary line, not a stray '0 failed' in a traceback."""
+    from agent.evaluation.evaluator import _parse_pytest_tally
+    out = (
+        "tests/test_r.py::test_render FAILED\n"
+        "E   AssertionError: expected banner '0 failed items' but got '3 items'\n"
+        "=========== short test summary info ===========\n"
+        "FAILED tests/test_r.py::test_render\n"
+        "FAILED tests/test_p.py::test_parse\n"
+        "20 failed, 5 passed in 1.23s\n"
+    )
+    passed, failed, skipped, failing = _parse_pytest_tally(out)
+    assert passed == 5
+    assert failed == 20            # from summary line, NOT the spurious "0 failed"
+    assert len(failing) == 2
+
+
+def test_evaluate_surfaces_skipped_tests(local_sandbox, policy, workspace):
+    """A green run that SKIPS required tests must surface it, not look like a clean pass."""
+    (workspace / "solution.py").write_text("def add(a, b):\n    return a + b\n")
+    (workspace / "test_solution.py").write_text(
+        "import pytest\n"
+        "from solution import add\n\n\n"
+        "def test_add():\n    assert add(2, 3) == 5\n\n\n"
+        "@pytest.mark.skip(reason='Extension system not yet implemented')\n"
+        "def test_feature():\n    assert False\n"
+    )
+    ev = Evaluator(local_sandbox, policy, initial_test_files=[])
+    result = ev.evaluate(workspace)
+    assert result.passed is False         # skip-to-green is unverified, not done
+    assert result.tests_skipped == 1
+    assert "SKIPPED" in result.summary    # surfaced loudly, not hidden as a clean green

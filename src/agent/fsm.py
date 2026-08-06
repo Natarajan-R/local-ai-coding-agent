@@ -11,6 +11,8 @@ logger = logging.getLogger(__name__)
 
 
 class AgentState(Enum):
+    """The states of the plan/execute/evaluate/reflect control loop."""
+
     IDLE = "idle"
     PLANNING = "planning"
     EXECUTING = "executing"
@@ -46,6 +48,8 @@ TERMINAL_STATES = (AgentState.DONE, AgentState.ABORTED, AgentState.ERROR)
 
 @dataclass
 class TransitionRecord:
+    """One recorded state change: the from-state, event, to-state and timestamp."""
+
     from_state: AgentState
     event: str
     to_state: AgentState
@@ -53,18 +57,23 @@ class TransitionRecord:
 
 
 class InvalidTransition(Exception):
-    pass
+    """Raised when an event has no valid transition from the current state."""
 
 
 class FSM:
+    """A minimal event-driven state machine with a recorded transition history."""
+
     def __init__(self, state: AgentState = AgentState.IDLE) -> None:
+        """Start the machine in ``state`` (IDLE by default) with an empty history."""
         self.state = state
         self.history: List[TransitionRecord] = []
 
     def can(self, event: str) -> bool:
+        """Return True if ``event`` is a legal transition from the current state."""
         return (self.state, event) in _TRANSITIONS
 
     def transition(self, event: str) -> AgentState:
+        """Apply ``event``, moving to the next state; raise InvalidTransition if illegal."""
         key = (self.state, event)
         if key not in _TRANSITIONS:
             raise InvalidTransition(f"No transition for '{event}' from {self.state.value}")
@@ -75,4 +84,5 @@ class FSM:
         return to_state
 
     def is_terminal(self) -> bool:
+        """Return True once the run has finished (DONE, ABORTED or ERROR)."""
         return self.state in TERMINAL_STATES

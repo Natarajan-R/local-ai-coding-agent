@@ -17,13 +17,17 @@ class _DefaultFieldsFilter(logging.Filter):
     """Ensure every record has a ``run_id`` so formatters never KeyError."""
 
     def filter(self, record: logging.LogRecord) -> bool:
+        """Default a missing ``run_id`` to ``-`` and always pass the record through."""
         if not hasattr(record, "run_id"):
             record.run_id = "-"
         return True
 
 
 class JsonFormatter(logging.Formatter):
+    """Format log records as single-line JSON objects for aggregators."""
+
     def format(self, record: logging.LogRecord) -> str:
+        """Render one record as a JSON line including level, logger and run_id."""
         payload = {
             "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
             "level": record.levelname,
@@ -41,6 +45,7 @@ def setup_logging(
     log_to_file: bool = True,
     json_logs: bool = False,
 ) -> logging.Logger:
+    """Configure root logging (Rich console + optional file log) and return the ``agent`` logger."""
     level = getattr(logging, log_level.upper(), logging.INFO)
     root = logging.getLogger()
     root.setLevel(level)

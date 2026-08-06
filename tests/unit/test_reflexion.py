@@ -1,4 +1,3 @@
-import pytest
 from unittest.mock import AsyncMock
 from agent.evaluation.reflexion import ReflexionEngine
 from agent.evaluation.evaluator import EvalResult
@@ -63,6 +62,6 @@ def test_reflexion_with_indexer(workspace):
     # Verify symbol structure is formatted and injected into prompt
     assert "actual symbol structure" in prompt_content
     assert "models.py" in prompt_content
-    assert "class `OrderItem`" in prompt_content
+    assert "Class `OrderItem`" in prompt_content
     assert "cart.py" in prompt_content
     assert "`models`" in prompt_content or "`models.OrderItem`" in prompt_content

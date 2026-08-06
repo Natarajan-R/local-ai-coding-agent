@@ -23,6 +23,7 @@ class ApprovalGate:
         prompt_fn: Optional[Callable[[str, str], bool]] = None,
         console: Optional[Console] = None,
     ) -> None:
+        """Configure the gate; disabled means auto-approve, ``prompt_fn`` overrides the console prompt."""
         self.enabled = enabled
         self._console = console or Console()
         self._prompt_fn = prompt_fn

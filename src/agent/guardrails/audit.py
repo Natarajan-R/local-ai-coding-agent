@@ -19,6 +19,7 @@ class AuditLogger:
     """
 
     def __init__(self, log_dir: Path, filename: str = "audit.jsonl") -> None:
+        """Create the audit directory and open ``<log_dir>/<filename>`` for appending."""
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.log_dir / filename
@@ -27,6 +28,7 @@ class AuditLogger:
         self.context: Dict[str, Any] = {}
 
     def record(self, action: str, **fields: Any) -> Dict[str, Any]:
+        """Append one timestamped record (action + context + fields) and return it."""
         entry: Dict[str, Any] = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "action": action,

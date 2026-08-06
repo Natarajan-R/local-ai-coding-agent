@@ -20,6 +20,10 @@
   "contributes": {
     "commands": [
       {
+        "command": "aiAgent.openChat",
+        "title": "AI Agent: Open Chat"
+      },
+      {
         "command": "aiAgent.openDashboard",
         "title": "AI Agent: Open Dashboard"
       },
@@ -45,6 +49,21 @@
           "type": "boolean",
           "default": false,
           "description": "Run in --auto mode (skip command-approval prompts)."
+        },
+        "aiAgent.promptStyle": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "inline",
+            "native"
+          ],
+          "default": "auto",
+          "enumDescriptions": [
+            "Ask in the chat thread when the panel is visible, otherwise use a native dialog.",
+            "Always ask inside the chat thread.",
+            "Always ask with a native VS Code dialog."
+          ],
+          "description": "Where command-approval and hint prompts are answered. Only one target is used at a time, so a decision is never asked twice."
         }
       }
     }

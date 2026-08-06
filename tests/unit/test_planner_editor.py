@@ -1,6 +1,5 @@
 import pytest
 import json
-from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock
 
 from agent.orchestrator import Orchestrator
@@ -47,7 +46,7 @@ async def test_planning_step_planner_editor(workspace):
     orch._chat = AsyncMock(return_value=mock_response)
     orch._chat_stream = AsyncMock(return_value=mock_response)
 
-    await orch._planning_step()
+    await orch.planner_agent.execute()
     
     assert orch.frame.metadata["checklist"] == mock_checklist
     assert orch.frame.plan == json.dumps(mock_checklist, indent=2)
@@ -67,7 +66,7 @@ async def test_planning_step_invalid_json_fallback(workspace):
     orch._chat = AsyncMock(return_value=mock_response)
     orch._chat_stream = AsyncMock(return_value=mock_response)
 
-    await orch._planning_step()
+    await orch.planner_agent.execute()
     
     checklist = orch.frame.metadata["checklist"]
     assert len(checklist) == 1
@@ -93,7 +92,7 @@ async def test_execution_step_planner_editor(workspace):
     orch._chat = AsyncMock(return_value=mock_response)
     orch._chat_stream = AsyncMock(return_value=mock_response)
 
-    await orch._execution_step()
+    await orch.coder_agent.execute()
     
     assert orch.fsm.state == AgentState.EVALUATING # transitioned via execution_done
     assert (workspace / "foo.py").exists()
@@ -130,7 +129,7 @@ async def test_execution_step_syntax_error_retry(workspace):
     orch._chat = mock_chat
     orch._chat_stream = mock_chat
 
-    await orch._execution_step()
+    await orch.coder_agent.execute()
     
     assert (workspace / "foo.py").exists()
     assert (workspace / "foo.py").read_text().strip() == good_content.strip()
@@ -186,9 +185,50 @@ async def test_reflexion_step_checklist_refinement(workspace):
     orch._chat_stream = AsyncMock(return_value=mock_response)
     
     # Run the reflexion step, should refine the checklist and transition to EXECUTING
-    await orch._reflexion_step()
+    await orch.reviewer_agent.execute_reflexion()
     
-    assert orch.frame.metadata["checklist"] == refined_checklist
+    # Refined items are now normalized through ChecklistItem.from_dict (the same
+    # validation the planner uses), so each item carries an explicit is_new flag.
+    assert orch.frame.metadata["checklist"] == [
+        {"path": "foo.py", "change_description": "fix syntax carefully", "is_new": False}
+    ]
+    assert orch.fsm.state == AgentState.EXECUTING
+
+
+@pytest.mark.asyncio
+async def test_reflexion_refinement_drops_invalid_items(workspace):
+    """A refined checklist item with a null/empty path must be dropped, not crash.
+
+    Regression for the case where the refiner returned raw model JSON verbatim: an
+    item like {"path": null, ...} reached the coder and raised TypeError on
+    `workspace / None`, aborting the whole run. The refiner now validates each item
+    through ChecklistItem.from_dict, so the invalid item is dropped and the one
+    good item survives.
+    """
+    orch = Orchestrator(workspace=workspace, interactive=False, sandbox_backend="local", planner_editor=True)
+    orch.fsm.state = AgentState.REFLEXING
+    orch.frame.metadata["checklist"] = [{"path": "foo.py", "change_description": "fix"}]
+
+    mock_eval = MagicMock()
+    mock_eval.details = "pytest failure"
+    mock_eval.__str__ = lambda s: "pytest failure"
+    orch.frame.metadata["last_eval"] = mock_eval
+
+    refined = [
+        {"path": None, "change_description": "invalid, no path"},
+        {"path": "foo.py", "change_description": "fix carefully"},
+    ]
+    mock_response = ChatResponse(content=f"```json\n{json.dumps(refined)}\n```", raw={})
+    orch._chat = AsyncMock(return_value=mock_response)
+    orch._chat_stream = AsyncMock(return_value=mock_response)
+
+    await orch.reviewer_agent.execute_reflexion()
+
+    checklist = orch.frame.metadata["checklist"]
+    assert checklist == [
+        {"path": "foo.py", "change_description": "fix carefully", "is_new": False}
+    ]
+    assert all(item["path"] for item in checklist)
     assert orch.fsm.state == AgentState.EXECUTING
 
 
@@ -241,7 +281,7 @@ async def test_reflexion_step_passes_impacted_tests(workspace):
     prompts.planner_refiner_messages = mock_refiner_messages
     
     try:
-        await orch._reflexion_step()
+        await orch.reviewer_agent.execute_reflexion()
     finally:
         prompts.planner_refiner_messages = original_refiner_msgs
         
@@ -281,7 +321,7 @@ async def test_orchestrator_passes_exclude_names(workspace):
         orch._chat = AsyncMock(return_value=mock_response)
         orch._chat_stream = AsyncMock(return_value=mock_response)
         
-        await orch._planning_step()
+        await orch.planner_agent.execute()
     finally:
         prompts.system_prompt = original_system_prompt
         
@@ -332,23 +372,6 @@ def test_apply_ast_splice_syntax_error():
     assert res is None
 
 
-def test_swe_bench_example_load():
-    from pathlib import Path
-    import json
-    
-    project_root = Path(__file__).resolve().parents[2]
-    example_path = project_root / "benchmarks" / "swe_bench_example.json"
-    
-    assert example_path.exists()
-    with open(example_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-        
-    assert "instance_id" in data
-    assert "repo" in data
-    assert "base_commit" in data
-    assert "problem_statement" in data
-
-
 @pytest.mark.asyncio
 async def test_reflexion_forces_is_new_false_for_existing_file(workspace):
     """enhancements-03 #2: on a retry, the checklist refiner can hallucinate
@@ -373,7 +396,7 @@ async def test_reflexion_forces_is_new_false_for_existing_file(workspace):
     orch._model_turn = AsyncMock(return_value=ChatResponse(
         content='[{"path": "foo.py", "change_description": "fix", "is_new": true}]', raw={}))
 
-    await orch._reflexion_step()
+    await orch.reviewer_agent.execute_reflexion()
 
     checklist = orch.frame.metadata["checklist"]
     assert checklist[0]["path"] == "foo.py"
@@ -406,3 +429,127 @@ def test_relevant_test_content_finds_matching_test_and_skips_tests(tmp_path):
     assert "Node is malformed" in got                 # editor now sees the spec
     # asking for a test file itself returns nothing (we never feed a test as target)
     assert orch._relevant_test_content("dot_dsl_test.py") == ""
+
+
+def test_is_stalled_triggers_on_repeated_identical_failures(workspace):
+    """No-progress stop: the SAME failing set on 3 consecutive evals must trip the stall."""
+    from agent.evaluation.evaluator import EvalResult
+    orch = Orchestrator(workspace=workspace, interactive=False, sandbox_backend="local")
+    rev = orch.reviewer_agent
+
+    same = EvalResult(False, "Tests failed", ran_tests=True,
+                      tests_failed=2, failing_tests=["t.py::a", "t.py::b"])
+    assert rev._is_stalled(same) is False   # 1st time: record, stall=0
+    assert rev._is_stalled(same) is False   # 2nd identical: stall=1
+    assert rev._is_stalled(same) is True    # 3rd identical: stall=2 -> STOP
+
+
+def test_is_stalled_resets_when_failures_change(workspace):
+    """Progress (a different failing set) must reset the stall counter."""
+    from agent.evaluation.evaluator import EvalResult
+    orch = Orchestrator(workspace=workspace, interactive=False, sandbox_backend="local")
+    rev = orch.reviewer_agent
+
+    two = EvalResult(False, "f", ran_tests=True, tests_failed=2, failing_tests=["a", "b"])
+    one = EvalResult(False, "f", ran_tests=True, tests_failed=1, failing_tests=["b"])
+    assert rev._is_stalled(two) is False
+    assert rev._is_stalled(two) is False    # stall=1
+    assert rev._is_stalled(one) is False    # progress! resets stall=0
+    assert rev._is_stalled(one) is False    # stall=1 again, not stopped
+    # A single 0/0/0 eval does not stall (allows the build a few shots).
+    blind = EvalResult(False, "f", ran_tests=True, tests_failed=0, failing_tests=[])
+    assert rev._is_stalled(blind) is False
+
+
+def test_handoff_report_written_on_unfinished_run(workspace):
+    """A non-DONE terminal state writes AGENT_HANDOFF.md with missing files + blocking error."""
+    from agent.evaluation.evaluator import EvalResult
+    orch = Orchestrator(workspace=workspace, interactive=False, sandbox_backend="local")
+    orch.frame.task_description = "Create exactly these files: src/app.py, setup.py."
+    (workspace / "src").mkdir(exist_ok=True)
+    (workspace / "src" / "app.py").write_text("x = 1\n")   # built; setup.py is missing
+    orch.frame.metadata["last_eval"] = EvalResult(
+        False, "Tests failed", details="ImportError: cannot import name 'SECRET_KEY'",
+        ran_tests=True, tests_passed=0, tests_failed=0)
+    orch.frame.last_error_summary = "Tests failed"
+    orch.frame.retry_count = 3
+
+    orch._write_handoff_report("error")
+
+    report = (workspace / "AGENT_HANDOFF.md").read_text()
+    assert "setup.py" in report                       # the missing requested file
+    assert "src/app.py" in report                     # what was built
+    assert "cannot import name 'SECRET_KEY'" in report # the blocking error
+    assert orch.frame.metadata["partial_report"]      # also stashed for the caller
+
+
+def test_is_stalled_triggers_on_repeated_collection_errors(workspace):
+    """A suite that cannot collect ANY test (0 passed, 0 failed) must stop honestly."""
+    from agent.evaluation.evaluator import EvalResult
+    orch = Orchestrator(workspace=workspace, interactive=False, sandbox_backend="local")
+    rev = orch.reviewer_agent
+    # 0/0/0 = broken import graph; the count-based stop has no signal, so this is the
+    # branch that made specs05 burn all 8 retries before the fix.
+    coll = EvalResult(False, "Tests failed", details="ImportError: cannot import name X",
+                      ran_tests=True, tests_passed=0, tests_failed=0, failing_tests=[])
+    assert rev._is_stalled(coll) is False   # collect_stall=1
+    assert rev._is_stalled(coll) is False   # collect_stall=2
+    assert rev._is_stalled(coll) is True    # collect_stall=3 -> STOP
+
+
+def test_collection_stall_resets_once_tests_run(workspace):
+    """If the suite starts collecting/running tests, the collection stall clears."""
+    from agent.evaluation.evaluator import EvalResult
+    orch = Orchestrator(workspace=workspace, interactive=False, sandbox_backend="local")
+    rev = orch.reviewer_agent
+    coll = EvalResult(False, "f", ran_tests=True, tests_passed=0, tests_failed=0, failing_tests=[])
+    ran = EvalResult(False, "f", ran_tests=True, tests_passed=3, tests_failed=1, failing_tests=["t::a"])
+    assert rev._is_stalled(coll) is False   # collect_stall=1
+    assert rev._is_stalled(coll) is False   # collect_stall=2
+    assert rev._is_stalled(ran) is False    # tests run now -> resets collection stall
+    assert rev._is_stalled(coll) is False   # back to collect_stall=1, not stopped
+
+
+@pytest.mark.asyncio
+async def test_refined_checklist_dedupes_repeated_paths(workspace):
+    """The refiner must collapse duplicate paths the model emits in one refined list."""
+    orch = Orchestrator(workspace=workspace, interactive=False, sandbox_backend="local", planner_editor=True)
+    orch.fsm.state = AgentState.REFLEXING
+    orch.frame.metadata["checklist"] = [{"path": "broker.py", "change_description": "impl"}]
+
+    mock_eval = MagicMock()
+    mock_eval.details = "pytest failure"
+    mock_eval.__str__ = lambda s: "pytest failure"
+    orch.frame.metadata["last_eval"] = mock_eval
+
+    # Model repeats redis_backend.py three times (the observed failure mode).
+    refined = [
+        {"path": "redis_backend.py", "change_description": "fix a"},
+        {"path": "redis_backend.py", "change_description": "fix b"},
+        {"path": "broker.py", "change_description": "fix c"},
+        {"path": "redis_backend.py", "change_description": "fix d"},
+    ]
+    mock_response = ChatResponse(content=f"```json\n{json.dumps(refined)}\n```", raw={})
+    orch._chat = AsyncMock(return_value=mock_response)
+    orch._chat_stream = AsyncMock(return_value=mock_response)
+
+    await orch.reviewer_agent.execute_reflexion()
+
+    paths = [item["path"] for item in orch.frame.metadata["checklist"]]
+    assert paths == ["redis_backend.py", "broker.py"]  # first mention of each, no dupes
+
+
+def test_is_stalled_triggers_on_count_not_improving_despite_set_churn(workspace):
+    """The real task-3 case: ~20 tests fail every retry, set churns, count never drops -> STOP."""
+    from agent.evaluation.evaluator import EvalResult
+    orch = Orchestrator(workspace=workspace, interactive=False, sandbox_backend="local")
+    rev = orch.reviewer_agent
+    e20a = EvalResult(False, "f", ran_tests=True, tests_failed=20,
+                      failing_tests=[f"t{i}" for i in range(20)])
+    e21 = EvalResult(False, "f", ran_tests=True, tests_failed=21,
+                     failing_tests=[f"t{i}" for i in range(21)])       # churn, worse
+    e20b = EvalResult(False, "f", ran_tests=True, tests_failed=20,
+                      failing_tests=[f"u{i}" for i in range(20)])       # different set, same count
+    assert rev._is_stalled(e20a) is False   # best=20, stall 0
+    assert rev._is_stalled(e21) is False    # 21 >= 20, stall 1
+    assert rev._is_stalled(e20b) is True    # 20 >= 20, stall 2 -> STOP (never improved)

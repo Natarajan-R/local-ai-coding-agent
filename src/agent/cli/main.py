@@ -24,6 +24,7 @@ async def _console_hint(context: str) -> Optional[str]:
                         title="Agent is stuck — provide a hint?", border_style="red"))
 
     def _read() -> str:
+        """Blocking stdin read, run in a thread; empty string means give up."""
         try:
             return input("Hint (or press Enter to give up): ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -54,8 +55,23 @@ def run(
     max_retries: int = typer.Option(2, "--max-retries", help="Reflexion retries on failure"),
     max_steps: int = typer.Option(25, "--max-steps", help="Max tool calls per execution phase"),
     model_retries: int = typer.Option(3, "--model-retries", help="Backoff retries per model call"),
-    num_ctx: int = typer.Option(8192, "--num-ctx", envvar="AI_AGENT_NUM_CTX",
-                                help="Model context window (tokens); prompts are trimmed to fit"),
+    request_interval: float = typer.Option(
+        0.0, "--request-interval", envvar="AI_AGENT_REQUEST_INTERVAL",
+        help="Min seconds between model requests — throttle to avoid rate-limits "
+             "on cloud models (e.g. 4). 0 = off (local servers).",
+    ),
+    num_ctx: int = typer.Option(16384, "--num-ctx", envvar="AI_AGENT_NUM_CTX",
+                                help="Model context window (tokens); prompts are trimmed to fit. "
+                                     "16384 fits a 24GB GPU fully; 8192 trims real multi-file tasks"),
+    temperature: float = typer.Option(
+        0.1, "--temperature", envvar="AI_AGENT_TEMPERATURE",
+        help="Model temperature (0.0=deterministic, 1.0=creative). "
+             "Lower values reduce hallucination; higher values add variety.",
+    ),
+    max_mutations: int = typer.Option(
+        8, "--max-mutations",
+        help="Max file modifications per reflexion cycle before switching to run_command heredocs.",
+    ),
     memory: bool = typer.Option(True, "--memory/--no-memory",
                                 help="Recall/save persistent project memory (.ai-agent/memory.jsonl)"),
     test_command: Optional[str] = typer.Option(
@@ -68,6 +84,14 @@ def run(
     log_level: str = typer.Option("INFO", "--log-level", envvar="AI_AGENT_LOG_LEVEL"),
     json_logs: bool = typer.Option(False, "--json-logs", help="Write logs/agent.log as JSON lines"),
     planner_editor: bool = typer.Option(False, "--planner-editor", help="Enable the Planner/Editor architecture instead of generic loop"),
+    milestones: bool = typer.Option(False, "--milestones", help="Build large specs as ordered, per-milestone-verified layers (helps smaller models). Implies --planner-editor."),
+    protect: list[str] = typer.Option(
+        [], "--protect",
+        envvar="AI_AGENT_PROTECT",
+        help="Glob (workspace-relative) the agent may READ but never WRITE. "
+             "Repeatable, e.g. --protect 'migrations/**' --protect '*.lock'. "
+             "Enforced by the tool layer, unlike an instruction in the prompt.",
+    ),
 ) -> None:
     """Run the agent on a single task.
 
@@ -93,8 +117,13 @@ def run(
         sandbox_network=network,
         num_ctx=num_ctx,
         use_memory=memory,
+        protected_paths=list(protect),
         escalation_callback=_console_hint if interactive else None,
         planner_editor=planner_editor,
+        request_interval=request_interval,
+        milestones=milestones,
+        temperature=temperature,
+        max_mutations=max_mutations,
     )
 
     try:
@@ -234,6 +263,21 @@ def memory(
 def version() -> None:
     """Print the agent version."""
     console.print(f"ai-coding-agent {__version__}")
+
+
+
+@app.command()
+def distill(
+    workspace: Path = typer.Option(Path("workspace"), "--workspace", "-w", help="Working directory"),
+    model: str = typer.Option("qwen2.5-coder:32b", "--model", "-m", help="Ollama model name"),
+    host: str = typer.Option("http://127.0.0.1:11435", "--host", help="Ollama server URL"),
+    output: str = typer.Option("code_review.md", "--output", "-o", help="Output file name"),
+    concurrency: int = typer.Option(5, "--concurrency", "-c", help="Concurrent map requests"),
+) -> None:
+    """Run the offline distillation (Map-Reduce) pipeline to generate a code review."""
+    from .distill import run_distillation
+    import asyncio
+    asyncio.run(run_distillation(workspace, model, host, output, concurrency))
 
 
 if __name__ == "__main__":

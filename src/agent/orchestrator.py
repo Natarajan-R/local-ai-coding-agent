@@ -1,56 +1,125 @@
 """The orchestrator: an FSM-driven plan/execute/evaluate/reflect loop."""
 from __future__ import annotations
 
+import ast
 import asyncio
 import logging
-import sys
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional, List, Dict, Any
 
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-from rich.markup import escape
-
+from .audit import AuditLogger
 from .context import ContextManager
+from .display import OrchestratorDisplay
 from .errors import TransientError
+from .event_bus import EventBus
 from .customizations import CustomizationLoader
+from .factory import ComponentFactory
+from .file_utils import FileSystemHelper
 from .memory import MemoryStore
+from .code_extract import CodeExtractor
 from .evaluation.evaluator import Evaluator
 from .evaluation.reflexion import ReflexionEngine
 from .fsm import FSM, AgentState
-from .model.client import OllamaClient
+from .model_service import ModelService
 from .perception.indexer import WorkspaceIndexer
 from .perception.lsp import LSPManager
 from . import prompts
+from .runtime import RuntimeState
 from .sandbox.config import SandboxConfig
 from .sandbox.manager import SandboxManager
 from .guardrails.policy import SecurityPolicy
 from .state import AgentFrame
+from .task_analysis import TaskAnalyzer
 from .telemetry import RunStats
-from .tools.parser import ToolParser, ToolCall
-from .tools.registry import ToolRegistry, ToolResult
+from .test_analysis import find_impacted_tests
+from .tools.parser import ToolParser
+from .tools.registry import ToolRegistry
 from .utils.circuit_breaker import CircuitBreaker
 from .utils.retry import async_retry
+from .agents.planner import PlannerAgent
+from .agents.config import AgentConfig
+from .agents.coder import CoderAgent
+from .agents.reviewer import ReviewerAgent
 
 logger = logging.getLogger(__name__)
-console = Console()
 
-# Default bound on tool calls within a single execution phase.
+# Constants
 DEFAULT_MAX_STEPS = 25
-
-# Tools that change the workspace. Everything else only looks.
-MUTATING_TOOLS = frozenset({
-    "write_file", "search_replace", "replace_all",
-    "add_docstring", "add_parameter", "rename_symbol"
-})
-# Default number of attempts for a single model call before giving up.
+MAX_BLOCKED_FINISHES = 2
 DEFAULT_MODEL_RETRIES = 3
+DEFAULT_CONTEXT_WINDOW = 8192
 
+
+class OrchestratorState(Enum):
+    """Internal orchestrator states."""
+    INITIALIZING = "initializing"
+    RUNNING = "running"
+    PAUSED = "paused"
+    STOPPED = "stopped"
+    FINALIZING = "finalizing"
+    COMPLETED = "completed"
+    ERROR = "error"
+
+
+@dataclass
+class OrchestratorConfig:
+    """Configuration for the orchestrator."""
+    workspace: Path
+    model_name: str = "qwen2.5:7b"
+    interactive: bool = True
+    sandbox_backend: str = "auto"
+    max_retries: int = 2
+    max_steps: int = DEFAULT_MAX_STEPS
+    model_retries: int = DEFAULT_MODEL_RETRIES
+    log_dir: Optional[Path] = None
+    host: str = "http://localhost:11434"
+    test_command: Optional[str] = None
+    sandbox_network: bool = False
+    num_ctx: int = DEFAULT_CONTEXT_WINDOW
+    use_memory: bool = True
+    protected_paths: Optional[List[str]] = None
+    planner_editor: bool = False
+    stop_when_green: bool = True
+    request_interval: float = 0.0
+    milestones: bool = False
+    temperature: float = 0.1
+    max_mutations: int = 8
+
+    @classmethod
+    def from_kwargs(cls, **kwargs) -> "OrchestratorConfig":
+        """Create config from keyword arguments."""
+        return cls(
+            workspace=Path(kwargs.get("workspace")),
+            model_name=kwargs.get("model_name", "qwen2.5:7b"),
+            interactive=kwargs.get("interactive", True),
+            sandbox_backend=kwargs.get("sandbox_backend", "auto"),
+            max_retries=kwargs.get("max_retries", 2),
+            max_steps=kwargs.get("max_steps", DEFAULT_MAX_STEPS),
+            model_retries=kwargs.get("model_retries", DEFAULT_MODEL_RETRIES),
+            log_dir=kwargs.get("log_dir"),
+            host=kwargs.get("host", "http://localhost:11434"),
+            test_command=kwargs.get("test_command"),
+            sandbox_network=kwargs.get("sandbox_network", False),
+            num_ctx=kwargs.get("num_ctx", DEFAULT_CONTEXT_WINDOW),
+            use_memory=kwargs.get("use_memory", True),
+            protected_paths=kwargs.get("protected_paths"),
+            planner_editor=kwargs.get("planner_editor", False),
+            stop_when_green=kwargs.get("stop_when_green", True),
+            temperature=kwargs.get("temperature", 0.1),
+            max_mutations=kwargs.get("max_mutations", 8),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
 
 class Orchestrator:
+    """Drives one task run through the FSM, owning the model, tools, sandbox and guardrails."""
+
     def __init__(
         self,
         workspace: Path,
@@ -60,124 +129,268 @@ class Orchestrator:
         max_retries: int = 2,
         max_steps: int = DEFAULT_MAX_STEPS,
         model_retries: int = DEFAULT_MODEL_RETRIES,
-        log_dir: Path | None = None,
+        log_dir: Optional[Path] = None,
         host: str = "http://localhost:11434",
-        test_command: str | None = None,
+        test_command: Optional[str] = None,
         sandbox_network: bool = False,
-        num_ctx: int = 8192,
+        num_ctx: int = DEFAULT_CONTEXT_WINDOW,
         use_memory: bool = True,
-        event_sink: Optional[Callable[[dict], None]] = None,
+        protected_paths: Optional[List[str]] = None,
+        event_sink: Optional[Callable[[Dict], None]] = None,
         approval_callback: Optional[Callable[[str, str], Awaitable[bool]]] = None,
         escalation_callback: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
         planner_editor: bool = False,
+        request_interval: float = 0.0,
+        milestones: bool = False,
+        temperature: float = 0.1,
+        max_mutations: int = 8,
     ) -> None:
-        self.workspace = Path(workspace).resolve()
-        self.max_steps = max_steps
-        # A green test suite only proves the agent finished if the agent actually
-        # did something. On a refactor the suite is green BEFORE the first edit, so
-        # an agent that stalls without touching a file evaluates green and reaches
-        # `done` having changed nothing. Track both halves of that condition.
-        self._mutations = 0            # successful workspace edits, whole run
-        self._no_progress_abort = False  # the loop detector bailed at some point
+        self.config = OrchestratorConfig(
+            workspace=workspace, model_name=model_name, interactive=interactive,
+            sandbox_backend=sandbox_backend, max_retries=max_retries, max_steps=max_steps,
+            model_retries=model_retries, log_dir=log_dir, host=host,
+            test_command=test_command, sandbox_network=sandbox_network, num_ctx=num_ctx,
+            use_memory=use_memory, protected_paths=protected_paths,
+            planner_editor=planner_editor, request_interval=request_interval,
+            milestones=milestones, temperature=temperature, max_mutations=max_mutations,
+        )
+        AgentConfig.configure(max_mutations=self.config.max_mutations)
+        if milestones:
+            self.config.planner_editor = True
+
+        self._state = OrchestratorState.INITIALIZING
         self.run_id = uuid.uuid4().hex[:8]
-        # Optional structured-event sink (e.g. the web server broadcaster).
-        self._event_sink = event_sink
-        # Optional human-escalation hook: called once when the retry budget is
-        # exhausted; may return a hint to grant one more round of attempts.
-        self._escalation_callback = escalation_callback
-        self.stats = RunStats()
+        self.runtime = RuntimeState(event_sink=event_sink, escalation_callback=escalation_callback)
+        self.log = logging.LoggerAdapter(logger, {"run_id": self.run_id})
+
+        # Core state (needed before _init_components wires ModelService)
         self.fsm = FSM()
         self.frame = AgentFrame(task_description="", max_retries=max_retries)
-        self.log = logging.LoggerAdapter(logger, {"run_id": self.run_id})
-        self._paused = False
-        self._paused_event = asyncio.Event()
-        self._paused_event.set()
-        self._stopped = False
-        self.stop_when_green = True
-        self.planner_editor = planner_editor
+        self.stats = RunStats()
 
-        self.model = OllamaClient(
-            model_name=model_name, host=host,
-            options={"temperature": 0.1, "num_ctx": num_ctx},
-        )
-        self.model_name = model_name
-        # Keep every model call within the context window.
-        self.context = ContextManager(max_tokens=num_ctx)
-        self.sandbox = SandboxManager(
-            SandboxConfig(
-                workspace=self.workspace,
-                backend=sandbox_backend,
-                network_disabled=not sandbox_network,
-            )
-        )
-        self.policy = SecurityPolicy(self.workspace, interactive=interactive, log_dir=log_dir)
-        # Correlate every audit record (including tool-level ones) with this run.
+        self._init_components(approval_callback=approval_callback)
+
+        self.planner_agent = PlannerAgent(self)
+        self.coder_agent = CoderAgent(self)
+        self.reviewer_agent = ReviewerAgent(self)
+
+        self._state = OrchestratorState.RUNNING
+
+    # ---- component wiring ----
+
+    def _init_components(self, approval_callback: Optional[Callable]) -> None:
+        self.model = ComponentFactory.create_model(self.config)
+        self.model_name = self.config.model_name
+        self.context = ContextManager(max_tokens=self.config.num_ctx)
+        self.sandbox = ComponentFactory.create_sandbox(self.config)
+        self.policy = ComponentFactory.create_policy(self.config)
         self.policy.audit.context = {"run_id": self.run_id}
-        self.indexer = WorkspaceIndexer(self.workspace)
-        self.customizations = CustomizationLoader(self.workspace)
-        # Persistent per-project memory (recalled into the planning context).
-        self.memory = MemoryStore(self.workspace, enabled=use_memory)
-        # Polymorphic LSP: routes each file to its language's server. Enabled
-        # only when at least one known server binary is installed; otherwise the
-        # model isn't offered semantic tools that can't run.
-        self.lsp = LSPManager(self.workspace) if LSPManager.is_available(self.workspace) else None
-        self.tools = ToolRegistry(
-            self.sandbox, self.policy, self.workspace,
-            lsp=self.lsp, approval_callback=approval_callback, indexer=self.indexer,
-            memory=self.memory,
+        self.audit = AuditLogger(self.policy.audit)
+        self.indexer = ComponentFactory.create_indexer(self.config)
+        self.memory = MemoryStore(self.config.workspace, enabled=self.config.use_memory)
+        self.lsp = ComponentFactory.create_lsp(self.config)
+        self.tools = ComponentFactory.create_tools(
+            sandbox=self.sandbox, policy=self.policy, workspace=self.config.workspace,
+            lsp=self.lsp, indexer=self.indexer, memory=self.memory,
+            approval_callback=approval_callback,
         )
         self.parser = ToolParser()
-        self.initial_test_files = self._find_test_files()
+        self.customizations = CustomizationLoader(self.config.workspace)
+        self.event_bus = EventBus(run_id=self.run_id, sink=self.runtime.event_sink)
+        self.initial_test_files = FileSystemHelper.find_test_files(self.config.workspace)
         self.evaluator = Evaluator(
             self.sandbox, self.policy,
-            test_command=test_command,
-            initial_test_files=self.initial_test_files
+            test_command=self.config.test_command, initial_test_files=self.initial_test_files,
         )
-
-        # Resilient model calls: retry with exponential backoff on transient
-        # errors, wrapped in a circuit breaker that trips on repeated failure.
-        self.model_circuit = CircuitBreaker(failure_threshold=5, recovery_timeout=60, name="model")
-        retry = async_retry(
-            max_attempts=model_retries,
-            base_delay=1.0,
-            max_delay=20.0,
-            exceptions=(TransientError,),
-        )
+        self.model_circuit = CircuitBreaker(failure_threshold=5, recovery_timeout=120, name="model")
+        retry = async_retry(max_attempts=self.config.model_retries, base_delay=1.0,
+                            max_delay=20.0, exceptions=(TransientError,))
         self._chat = self.model_circuit(retry(self.model.chat))
         self._chat_stream = self.model_circuit(retry(self.model.chat_stream))
-        self._stream = True
-
+        self.model_service = ModelService(
+            context=self.context,
+            get_chat=lambda: self._chat,
+            get_chat_stream=lambda: self._chat_stream,
+            stats=self.stats,
+            event_bus=self.event_bus,
+        )
         self.reflexion = ReflexionEngine(
             self.model, self.evaluator, self.sandbox, self.policy,
-            indexer=self.indexer, chat_fn=self._chat
+            indexer=self.indexer, chat_fn=self._chat,
         )
 
-    def _audit(self, action: str, **fields) -> None:
-        """Record an audit entry (run_id is injected by the audit context)."""
-        self.policy.audit.record(action, **fields)
+    # ---- public API ----
 
-    def emit(self, event: str, **data) -> None:
-        """Publish a structured UI event to the optional event sink.
+    @property
+    def workspace(self) -> Path:
+        if hasattr(self, "config"):
+            return self.config.workspace
+        return getattr(self, "_mock_workspace", None)
 
-        Sinks (e.g. the web server) are synchronous and non-blocking; failures
-        never affect the run.
-        """
-        if self._event_sink is None:
-            return
-        try:
-            self._event_sink({"event": event, "run_id": self.run_id, **data})
-        except Exception:  # pragma: no cover - a UI sink must never break a run
-            self.log.debug("event sink error for %s", event, exc_info=True)
+    @workspace.setter
+    def workspace(self, value: Path) -> None:
+        if hasattr(self, "config"):
+            self.config.workspace = value
+        else:
+            self._mock_workspace = value
+
+    @property
+    def interactive(self) -> bool:
+        return self.config.interactive
+
+    @property
+    def stop_when_green(self) -> bool:
+        return self.config.stop_when_green
+
+    @stop_when_green.setter
+    def stop_when_green(self, value: bool) -> None:
+        self.config.stop_when_green = value
+
+    @property
+    def max_steps(self) -> int:
+        return self.config.max_steps
+
+    @max_steps.setter
+    def max_steps(self, value: int) -> None:
+        self.config.max_steps = value
+
+    @property
+    def planner_editor(self) -> bool:
+        return self.config.planner_editor
+
+    @planner_editor.setter
+    def planner_editor(self, value: bool) -> None:
+        self.config.planner_editor = value
+
+    # ---- backward-compatible runtime-state accessors ----
+
+    @property
+    def _stopped(self) -> bool:
+        return self.runtime.stopped
+
+    @_stopped.setter
+    def _stopped(self, value: bool) -> None:
+        self.runtime.stopped = value
+
+    @property
+    def _paused(self) -> bool:
+        return self.runtime.paused
+
+    @_paused.setter
+    def _paused(self, value: bool) -> None:
+        self.runtime.paused = value
+
+    @property
+    def _paused_event(self) -> asyncio.Event:
+        return self.runtime.paused_event
+
+    @property
+    def _mutations(self) -> int:
+        return self.runtime.mutations
+
+    @_mutations.setter
+    def _mutations(self, value: int) -> None:
+        self.runtime.mutations = value
+
+    @property
+    def _no_progress_abort(self) -> bool:
+        return self.runtime.no_progress_abort
+
+    @_no_progress_abort.setter
+    def _no_progress_abort(self, value: bool) -> None:
+        self.runtime.no_progress_abort = value
+
+    @property
+    def _baseline_green(self) -> Optional[bool]:
+        return self.runtime.baseline_green
+
+    @_baseline_green.setter
+    def _baseline_green(self, value: Optional[bool]) -> None:
+        self.runtime.baseline_green = value
+
+    @property
+    def _stream(self) -> bool:
+        return self.runtime.stream
+
+    @_stream.setter
+    def _stream(self, value: bool) -> None:
+        self.runtime.stream = value
+
+    @property
+    def _escalation_callback(self) -> Optional[Callable]:
+        return self.runtime.escalation_callback
+
+    # ---- run lifecycle ----
 
     async def run_task(self, task: str, stream: bool = True) -> AgentFrame:
+        """Run one task end to end through the FSM and return the final frame."""
         self.frame.task_description = task
-        self._stream = stream
+        self.runtime.stream = stream
         self.log.info("Task start: %s", task)
-        self._audit(
-            "task_start", task=task, model=self.model_name,
-            workspace=str(self.workspace), stream=stream,
-        )
-        self.emit("run_started", task=task, model=self.model_name, workspace=str(self.workspace))
+        self.audit.record("task_start", task=task, model=self.model_name,
+                          workspace=str(self.config.workspace), stream=stream)
+        self.event_bus.emit("run_started", task=task, model=self.model_name,
+                            workspace=str(self.config.workspace))
+        try:
+            await self._initialize_environment()
+            OrchestratorDisplay.display_task_header(task, self.run_id, self.model_name)
+            if not await self._check_model_availability():
+                return self.frame
+            self.fsm.transition("start")
+            transient_backoff = 1.0
+            MAX_TRANSIENT_RETRIES = 5
+            transient_retries = 0
+            while not self.fsm.is_terminal():
+                if await self._handle_stop_or_pause():
+                    break
+                self.emit("state_changed", state=self.fsm.state.value)
+                try:
+                    await self._execute_state(self.fsm.state)
+                    transient_backoff = 1.0
+                    transient_retries = 0
+                except TransientError as exc:
+                    transient_retries += 1
+                    if transient_retries > MAX_TRANSIENT_RETRIES:
+                        self.log.error(
+                            "Transient error persisted after %d retries, giving up: %s",
+                            MAX_TRANSIENT_RETRIES, exc,
+                        )
+                        await self._handle_error(exc)
+                        break
+                    sleep_for = min(transient_backoff, 30.0)
+                    self.log.warning(
+                        "Transient error (attempt %d/%d), retrying in %.0fs: %s",
+                        transient_retries, MAX_TRANSIENT_RETRIES, sleep_for, exc,
+                    )
+                    metrics = self.model_circuit.get_metrics()
+                    OrchestratorDisplay.print_transient_error(exc, metrics)
+                    await asyncio.sleep(sleep_for)
+                    transient_backoff *= 2
+                except Exception as exc:
+                    transient_retries = 0
+                    await self._handle_error(exc)
+        finally:
+            await self._cleanup()
+        return self.frame
+
+    def pause(self) -> None:
+        self.runtime.paused = True
+        self.runtime.paused_event.clear()
+        self._state = OrchestratorState.PAUSED
+
+    def resume(self) -> None:
+        self.runtime.paused = False
+        self.runtime.paused_event.set()
+        self._state = OrchestratorState.RUNNING
+
+    def stop(self) -> None:
+        self.runtime.stopped = True
+        self.runtime.paused_event.set()
+        self._state = OrchestratorState.STOPPED
+
+    # ---- private: environment lifecycle ----
+
+    async def _initialize_environment(self) -> None:
         self.sandbox.start()
         if self.lsp is not None:
             try:
@@ -185,1066 +398,236 @@ class Orchestrator:
             except Exception as exc:
                 self.log.warning("LSP server failed to start: %s", exc)
                 self.lsp = None
-        console.print(
-            Panel(
-                f"[bold green]Task:[/bold green] {escape(task)}\n[dim]run {self.run_id} · model {self.model_name}[/dim]",
-                title="AI Coding Agent",
-            )
-        )
+        self._capture_green_baseline()
 
-        if not await self.model.is_available():
-            console.print(
-                "[bold red]Ollama is not reachable at "
-                f"{self.model.host}.[/bold red] Start it with `ollama serve`."
-            )
-            self.log.error("Ollama not reachable at %s", self.model.host)
-            self._audit("model_unavailable", host=self.model.host)
-            self.fsm.transition("start")
-            self.fsm.transition("error")
-            await self.model.close()
-            self._finalize()
-            return self.frame
-
-        self.fsm.transition("start")
-        try:
-            while not self.fsm.is_terminal():
-                if self._stopped:
-                    self.log.info("Run stopped by user request")
-                    self.emit("run_stopped", reason="User request")
-                    if self.fsm.can("error"):
-                        self.fsm.transition("error")
-                    else:
-                        self.fsm.state = AgentState.ERROR
-                    break
-
-                if self._paused:
-                    self.log.info("Run paused by user request. Waiting for resume...")
-                    self.emit("run_paused")
-                    await self._paused_event.wait()
-                    self.log.info("Run resumed by user request.")
-                    self.emit("run_resumed")
-                    if self._stopped:
-                        continue
-
-                state = self.fsm.state
-                self.emit("state_changed", state=state.value)
-                try:
-                    if state == AgentState.PLANNING:
-                        await self._planning_step()
-                    elif state == AgentState.EXECUTING:
-                        await self._execution_step()
-                    elif state == AgentState.EVALUATING:
-                        await self._evaluation_step()
-                    elif state == AgentState.REFLEXING:
-                        await self._reflexion_step()
-                    else:  # pragma: no cover - defensive
-                        break
-                except Exception as exc:
-                    await self._handle_error(exc)
-        finally:
-            await self.model.close()
+    async def _cleanup(self) -> None:
+        await self.model.close()
+        if self.lsp is not None:
             try:
-                if self.lsp is not None:
-                    await self.lsp.stop()
+                await self.lsp.stop()
             except Exception:
                 pass
-            self._finalize()
-        return self.frame
+        self.sandbox.stop()
+        self._finalize()
 
-    async def _model_turn(self, messages, tools=None, label: str = ""):
-        """Call the model, streaming tokens to the console when enabled.
-
-        Whether streamed or not, returns a complete ``ChatResponse`` so the
-        caller can still parse tool calls from the full message.
-        """
-        # Trim the conversation to fit the model's context window before sending.
-        fitted = self.context.fit(messages)
-        if fitted.trimmed:
-            self.log.info(
-                "Context trimmed: dropped %d msg(s), ~%d tokens sent",
-                fitted.dropped, fitted.est_tokens,
-            )
-            self.emit("context_trimmed", dropped=fitted.dropped, est_tokens=fitted.est_tokens)
-        send_messages = fitted.messages
-
-        if not self._stream:
-            response = await self._chat(send_messages, tools)
-            self.stats.record(response.raw)
-            self.emit("assistant_message", label=label, content=response.content)
-            return response
-
-        if label:
-            from rich.markup import escape
-            console.print(f"[dim]{escape(label)}[/dim]")
-        wrote = {"any": False}
-
-        def writer(token: str) -> None:
-            wrote["any"] = True
-            sys.stdout.write(token)
-            sys.stdout.flush()
-            self.emit("token", text=token, label=label)
-
-        response = await self._chat_stream(send_messages, tools, on_token=writer)
-        if wrote["any"]:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-        self.stats.record(response.raw)
-        return response
-
-    # -- phases --------------------------------------------------------------
-    async def _planning_step(self) -> None:
-        skeleton = self.indexer.get_repo_skeleton()
-        memory_text = self.memory.format_for_prompt()
-        if memory_text:
-            self.log.info("Loaded %d memory entrie(s) into context", self.memory.count())
-            self.emit("memory_loaded", count=self.memory.count())
-        
-        # Load workspace customizations (rules and matched skills)
-        custom_rules = self.customizations.load_rules()
-        custom_skills = self.customizations.load_skills(self.frame.task_description)
-        customizations = custom_rules + custom_skills
-
-        if self.planner_editor:
-            messages = prompts.planner_messages(self.frame.task_description, skeleton, memory_text, customizations=customizations)
-            response = await self._model_turn(messages, label="Planning Checklist...")
-            checklist_text = response.content.strip()
-            
-            import re
-            json_match = re.search(r"```json\s*(.*?)\s*```", checklist_text, re.DOTALL)
-            if json_match:
-                checklist_text = json_match.group(1).strip()
-            elif checklist_text.startswith("```") and checklist_text.endswith("```"):
-                checklist_text = checklist_text.strip("`").strip()
-            
-            import json
-            try:
-                checklist = json.loads(checklist_text)
-                if not isinstance(checklist, list):
-                    raise ValueError("JSON is not a list")
-            except Exception as exc:
-                self.log.warning("Planner returned invalid JSON checklist: %s", exc)
-                target_file = self._find_target_file() or "solution.py"
-                checklist = [{
-                    "path": target_file,
-                    "change_description": f"Implement the requested task: {self.frame.task_description}",
-                    "is_new": not (self.workspace / target_file).exists()
-                }]
-            
-            if isinstance(checklist, list):
-                for task in checklist:
-                    if isinstance(task, dict) and task.get("path"):
-                        target_file = self.workspace / task["path"]
-                        if target_file.exists():
-                            task["is_new"] = False
-            self.frame.metadata["checklist"] = checklist
-            self.frame.plan = json.dumps(checklist, indent=2)
-            self.log.info("Planner checklist created with %d tasks", len(checklist))
-            self.emit("plan", text=self.frame.plan)
-            if not self._stream:
-                console.print(Panel(escape(self.frame.plan), title="Checklist", border_style="cyan"))
-
-            exclude_names = set()
-            if self._is_single_file_workspace():
-                exclude_names.update({"rename_symbol", "add_parameter", "add_docstring"})
-
-            self.frame.messages = [
-                {"role": "system", "content": prompts.system_prompt(exclude_names=exclude_names)}
-            ]
-        else:
-            messages = prompts.planning_messages(self.frame.task_description, skeleton, memory_text, customizations=customizations)
-            response = await self._model_turn(messages, label="Planning...")
-            self.frame.plan = response.content.strip()
-            self.log.info("Plan created (%d chars)", len(self.frame.plan or ""))
-            self._audit("plan_created", plan_chars=len(self.frame.plan or ""))
-            self.emit("plan", text=self.frame.plan or "")
-            if not self._stream:
-                console.print(Panel(escape(self.frame.plan or "(no plan)"), title="Plan", border_style="cyan"))
-
-            # Seed the execution conversation.
-            exclude_names = set()
-            if self._is_single_file_workspace():
-                exclude_names.update({"rename_symbol", "add_parameter", "add_docstring"})
-            system_content = prompts.system_prompt(exclude_names=exclude_names)
-            if customizations:
-                system_content += "\n\nAdditional instructions and guidelines for this workspace/task:\n" + "\n\n".join(customizations)
-            self.frame.messages = [
-                {"role": "system", "content": system_content},
-                prompts.execution_primer(self.frame.task_description, self.frame.plan or ""),
-            ]
-            if memory_text:
-                self.frame.messages.append({"role": "user", "content": memory_text})
-            for lesson in self.frame.reflections:
-                self.frame.messages.append(
-                    {"role": "user", "content": f"Lesson from a previous attempt: {lesson}"}
-                )
-        self.fsm.transition("plan_ready")
-
-    async def _execution_step(self) -> None:
-        if self.planner_editor:
-            checklist = self.frame.metadata.get("checklist") or []
-            if not checklist:
-                self.log.warning("No checklist found for planner_editor execution")
-                self.fsm.transition("execution_done")
-                return
-
-            reflexion_lesson = self.frame.reflections[-1] if self.frame.reflections else ""
-
-            for idx, item in enumerate(checklist):
-                if self._stopped:
-                    break
-                if self._paused:
-                    self.log.info("Run paused by user request. Waiting for resume...")
-                    self.emit("run_paused")
-                    await self._paused_event.wait()
-                    self.log.info("Run resumed by user request.")
-                    self.emit("run_resumed")
-                    if self._stopped:
-                        break
-
-                path = item.get("path")
-                change_description = item.get("change_description")
-                is_new = item.get("is_new", False)
-
-                self.log.info("Processing task %d/%d: %s (is_new=%s)", idx + 1, len(checklist), path, is_new)
-                self.emit("tool_call", step=idx+1, tool=f"editor:{path}", args={"change": change_description})
-
-                # Read clean/fresh content from workspace disk
-                target_path = self.workspace / path
-                original_content = ""
-                file_lines = 0
-                if not is_new and target_path.exists():
-                    try:
-                        original_content = target_path.read_text(encoding="utf-8", errors="replace")
-                        file_lines = len(original_content.splitlines())
-                    except Exception as e:
-                        self.log.warning("Failed to read file %s: %s", path, e)
-
-                exclude_names = set()
-                if is_new:
-                    exclude_names.update({"search_replace", "replace_all"})
-                if self._is_single_file_workspace():
-                    exclude_names.update({"rename_symbol", "add_parameter", "add_docstring"})
-
-                # Initialize subtask messages
-                try:
-                    repo_map = self.indexer.get_repo_skeleton()
-                except Exception as e:
-                    self.log.warning("Failed to get repo skeleton: %s", e)
-                    repo_map = ""
-
-                subtask_messages = [
-                    {"role": "system", "content": prompts.subtask_system_prompt(path, change_description, exclude_names=exclude_names)},
-                    {"role": "user", "content": prompts.subtask_user_prompt(
-                        task=self.frame.task_description,
-                        path=path,
-                        change_description=change_description,
-                        content=original_content,
-                        repo_map=repo_map,
-                        reflexion_lesson=reflexion_lesson,
-                        test_content=self._relevant_test_content(path)
-                    )}
-                ]
-
-                # Local subtask tool-use execution loop (up to 5 steps)
-                subtask_success = False
-                offered_tools = self.tools.get_descriptions()
-                
-                if exclude_names:
-                    offered_tools = [t for t in offered_tools if t.get("function", {}).get("name") not in exclude_names]
-
-                mutation_steps = 0
-                sub_loc_counts: dict = {}  # edits per (file, region) — catches same-spot thrash
-                for sub_step in range(1, 16):
-                    if self._stopped:
-                        break
-                    
-                    response = await self._model_turn(subtask_messages, offered_tools, label=f"Editing {path} (subtask step {sub_step})...")
-                    subtask_messages.append({"role": "assistant", "content": response.content or ""})
-
-                    # Parse tool calls from model response
-                    native = self.parser.parse_native(response.tool_calls)
-                    calls = native or self.parser.parse(response.content)
-
-                    # Fallback for implicit code blocks
-                    if not calls:
-                        is_py = path.endswith(".py")
-                        implicit_code = self._extract_implicit_code(response.content or "", is_py)
-                        if implicit_code:
-                            self.log.info("Converted implicit code block to write_file for %s", path)
-                            calls = [ToolCall(name="write_file", arguments={"path": path, "content": implicit_code})]
-                            
-                            # If no syntax error in the python file, treat it as successful direct completion
-                            if is_py:
-                                from .perception.analysis import python_syntax_errors
-                                errors = python_syntax_errors(implicit_code, filename=path)
-                                if not errors:
-                                    result = await self.tools.execute("write_file", {"path": path, "content": implicit_code})
-                                    if result.ok:
-                                        self._mutations += 1
-                                    subtask_success = True
-                                    subtask_messages.append({
-                                        "role": "user",
-                                        "content": f"File '{path}' successfully written with no syntax errors. Subtask completed."
-                                    })
-                                    break
-                            else:
-                                result = await self.tools.execute("write_file", {"path": path, "content": implicit_code})
-                                if result.ok:
-                                    self._mutations += 1
-                                subtask_success = True
-                                subtask_messages.append({
-                                    "role": "user",
-                                    "content": f"File '{path}' successfully written. Subtask completed."
-                                })
-                                break
-
-                    if not calls:
-                        if self.parser.saw_truncated_call(response.content or ""):
-                            # The call was cut off mid-JSON (too long), not absent.
-                            # Telling the model to "use a tool" makes it resend the
-                            # same oversized call and burn the step budget; tell it
-                            # to shrink the edit instead.
-                            subtask_messages.append({
-                                "role": "user",
-                                "content": (
-                                    "Your previous tool call was cut off before it finished "
-                                    "(incomplete JSON), so it was NOT applied. It was too long. "
-                                    "Send a SMALLER edit: change fewer lines at once, or use "
-                                    "search_replace on a short, unique snippet instead of "
-                                    "rewriting a large block in one call."
-                                ),
-                            })
-                        else:
-                            # Nudge the model to use a tool if it only produced prose
-                            subtask_messages.append({
-                                "role": "user",
-                                "content": "Respond with exactly one tool call in the required JSON format.",
-                            })
-                        continue
-
-                    call = calls[0]
-                    self.log.info("Subtask tool call: %s %s", call.name, call.arguments)
-
-                    # Intercept the finish tool
-                    if call.name == "finish":
-                        can_finish = True
-                        if self._is_single_file_workspace():
-                            eval_result = await asyncio.to_thread(self.evaluator.evaluate, self.workspace)
-                            if not eval_result.passed:
-                                can_finish = False
-                                subtask_messages.append({
-                                    "role": "user",
-                                    "content": f"Cannot finish subtask. Local tests are failing with this error:\n{eval_result.summary}\nPlease resolve the failures or correct the code before calling finish."
-                                })
-                        else:
-                            if path.endswith(".py") and target_path.exists():
-                                from .perception.analysis import python_syntax_errors
-                                try:
-                                    current_content = target_path.read_text(encoding="utf-8")
-                                    errors = python_syntax_errors(current_content, filename=path)
-                                    if errors:
-                                        can_finish = False
-                                        subtask_messages.append({
-                                            "role": "user",
-                                            "content": f"Cannot finish subtask. The file '{path}' has compilation/syntax errors:\n" + "; ".join(errors) + "\nPlease fix the syntax errors before calling finish."
-                                        })
-                                except Exception:
-                                    pass
-
-                        if can_finish:
-                            subtask_success = True
-                            subtask_messages.append({
-                                "role": "user",
-                                "content": "Subtask completed successfully."
-                            })
-                            break
-                        else:
-                            continue
-
-                    # Execute the tool
-                    mutation_tools = ("write_file", "search_replace", "edit_lines", "replace_all", "add_parameter", "add_docstring", "rename_symbol")
-                    if call.name in mutation_tools:
-                        if mutation_steps >= 4:
-                            result = ToolResult(False, "Modification budget exhausted. You have already made 4 edits. You must run verification tests and call finish immediately.")
-                        else:
-                            result = await self.tools.execute(call.name, call.arguments)
-                            if result.ok:
-                                self._mutations += 1
-                                mutation_steps += 1
-                                if mutation_steps >= 4:
-                                    result.content += "\n\nWarning: You have exhausted your file modification budget. You must verify your current code via tests and call finish immediately."
-                    else:
-                        result = await self.tools.execute(call.name, call.arguments)
-                    
-                    subtask_messages.append({
-                        "role": "user",
-                        "content": f"Tool '{call.name}' result: {result.content}"
-                    })
-
-                    # Location-thrash guard: re-editing the same region over and
-                    # over (with slightly different content each time) is the
-                    # dominant non-convergence pattern and the mutation budget above
-                    # does not catch it — a failed or dropped edit costs a step but
-                    # not budget. After a few edits to the same spot, tell the model
-                    # to stop patching and rewrite the whole file, which is what the
-                    # model solves one-shot.
-                    if call.name in ("edit_lines", "search_replace"):
-                        loc_key = (
-                            str(call.arguments.get("path", path)),
-                            call.arguments.get("start_line")
-                            if call.name == "edit_lines"
-                            else str(call.arguments.get("search", ""))[:40],
-                        )
-                        sub_loc_counts[loc_key] = sub_loc_counts.get(loc_key, 0) + 1
-                        if sub_loc_counts[loc_key] == 3:
-                            subtask_messages.append({
-                                "role": "user",
-                                "content": (
-                                    f"You have edited the same part of '{path}' several times "
-                                    "and it is still not right. Stop making small edits there. "
-                                    "Read the whole file, then replace it in ONE `write_file` "
-                                    "call with a complete, correct implementation."
-                                ),
-                            })
-
-                    # Compile gate syntax check for python edits
-                    if path.endswith(".py") and target_path.exists():
-                        from .perception.analysis import python_syntax_errors
-                        try:
-                            current_content = target_path.read_text(encoding="utf-8")
-                            errors = python_syntax_errors(current_content, filename=path)
-                            if errors:
-                                subtask_messages.append({
-                                    "role": "user",
-                                    "content": f"Warning: The current file '{path}' has compilation/syntax errors:\n" + "; ".join(errors) + "\nPlease fix the syntax errors."
-                                })
-                        except Exception:
-                            pass
-
-                self.log.info("Finished task %d/%d for %s: success=%s", idx + 1, len(checklist), path, subtask_success)
-                self.emit("tool_result", step=idx+1, tool=f"editor:{path}", ok=subtask_success, content=f"Subtask completed for {path}")
-
-            self.fsm.transition("execution_done")
+    def _capture_green_baseline(self) -> None:
+        if not self.config.stop_when_green:
+            self.runtime.baseline_green = False
             return
-
-        tools = self.tools.get_descriptions()
-        if self._is_single_file_workspace():
-            exclude_names = {"rename_symbol", "add_parameter", "add_docstring"}
-            tools = [t for t in tools if t.get("function", {}).get("name") not in exclude_names]
-        # signature -> self._mutations when it was last performed. Not a set:
-        # repeating an action is only evidence of wandering if NOTHING changed
-        # since last time. Re-running the test command after each new file is
-        # correct behaviour, and treating it as a loop aborted multi-file work
-        # roughly one run in three.
-        seen: dict[tuple, int] = {}
-        redundant = 0              # count of repeated (already-performed) actions
-        for step in range(1, self.max_steps + 1):
-            if self._stopped:
-                break
-            if self._paused:
-                self.log.info("Run paused by user request. Waiting for resume...")
-                self.emit("run_paused")
-                await self._paused_event.wait()
-                self.log.info("Run resumed by user request.")
-                self.emit("run_resumed")
-                if self._stopped:
-                    break
-
-            response = await self._model_turn(self.frame.messages, tools, label=f"step {step}")
-
-            native = self.parser.parse_native(response.tool_calls)
-            calls = native or self.parser.parse(response.content)
-
-            if not calls:
-                target_file = self._find_target_file()
-                if target_file:
-                    is_py = target_file.endswith(".py")
-                    implicit_code = self._extract_implicit_code(response.content or "", is_py)
-                    if implicit_code:
-                        self.log.info("Converted implicit code block to write_file tool call for %s", target_file)
-                        call = ToolCall(name="write_file", arguments={"path": target_file, "content": implicit_code})
-                        calls = [call]
-
-            if not calls:
-                console.print(f"[dim]step {step}: model produced no tool call[/dim]")
-                self.frame.messages.append({"role": "assistant", "content": response.content})
-                if self.parser.saw_truncated_call(response.content or ""):
-                    # Cut off mid-JSON (too long), not absent — ask for a smaller edit.
-                    self.frame.messages.append({
-                        "role": "user",
-                        "content": (
-                            "Your previous tool call was cut off before it finished "
-                            "(incomplete JSON), so it was NOT applied. It was too long. Send a "
-                            "SMALLER edit: change fewer lines at once, or use search_replace on "
-                            "a short, unique snippet instead of rewriting a large block."
-                        ),
-                    })
-                else:
-                    # Nudge the model to use a tool if it only produced prose.
-                    self.frame.messages.append({
-                        "role": "user",
-                        "content": "Respond with exactly one tool call in the required JSON format.",
-                    })
-                continue
-
-            self.frame.messages.append({"role": "assistant", "content": response.content or ""})
-
-            call = calls[0]
-            console.print(f"[bold cyan]→ {call.name}[/bold cyan] {list(call.arguments)}")
-            self.emit("tool_call", step=step, tool=call.name, args=call.arguments)
-            if self._is_single_file_workspace() and call.name in {"rename_symbol", "add_parameter", "add_docstring"}:
-                result = ToolResult(False, f"Error: The tool '{call.name}' is not available in a single-file workspace. Please use 'write_file' or 'search_replace' to make edits.")
-            else:
-                result = await self.tools.execute(call.name, call.arguments)
-            # Redact secrets once, at the boundary — before the output reaches the
-            # console, the model's context, or the dashboard. Any tool's output
-            # (read_file, search, …) is covered here, not just run_command.
-            safe_content = self.policy.scrub(result.content)
-            from rich.markup import escape
-            console.print(f"[dim]{escape(safe_content[:500])}[/dim]")
-            self.log.info("step %d: %s ok=%s", step, call.name, result.ok)
-            if result.ok and call.name in MUTATING_TOOLS:
-                self._mutations += 1
-            self._audit(
-                "tool_call", step=step, tool=call.name,
-                args=list(call.arguments), ok=result.ok,
-            )
-            self.emit("tool_result", step=step, tool=call.name, ok=result.ok,
-                      content=safe_content)
-
-            self.frame.messages.append({
-                "role": "tool",
-                "content": safe_content,
-                "name": call.name,
-            })
-
-            # Stop-when-green guard: if tests pass, force finish.
-            if self.stop_when_green and (call.name in MUTATING_TOOLS or call.name == "run_command"):
-                eval_result = await asyncio.to_thread(self.evaluator.evaluate, self.workspace)
-                if eval_result.passed and eval_result.ran_tests:
-                    self.log.info("Stop-when-green: tests passed. Forcing finish.")
-                    console.print("[green]Stop-when-green: tests passed. Forcing finish.[/green]")
-                    result.is_final = True
-                    result.content = "Stop-when-green: tests passed successfully."
-
-            # No-progress detection. Track EVERY action performed this phase, not
-            # just the immediately preceding one: a wandering model that repeats
-            # an earlier action (write -> run -> re-read -> run ...) makes no real
-            # progress even though consecutive calls differ. Repeating any prior
-            # action is the signal; nudge on each repeat and bail after a few.
-            sig = (call.name, repr(sorted(call.arguments.items())))
-            last_mutations = seen.get(sig)
-            # A repeat of a *verification* action is only no-progress if the
-            # workspace has not moved since -- re-running the tests after each
-            # new file is correct, and calling that a loop aborted multi-file
-            # work about one run in three. The exemption is limited to
-            # non-mutating tools on purpose: an edit tool repeating identical
-            # arguments bumps _mutations itself and would exempt itself forever.
-            VERIFY_TOOLS = {"run_command", "get_diagnostics", "read_file",
-                            "list_files", "outline", "search_text", "read_symbol"}
-            moved = (call.name in VERIFY_TOOLS and last_mutations != self._mutations)
-            if last_mutations is not None and not moved:
-                redundant += 1
-                self.log.info("Redundant repeat of %s (x%d) at step %d", call.name, redundant, step)
-                self.frame.messages.append({
-                    "role": "user",
-                    "content": (
-                        f"You already ran `{call.name}` with those arguments earlier. "
-                        "Do not repeat actions. If the change is complete and verified, "
-                        "call the `finish` tool now with a short summary; otherwise take "
-                        "a genuinely different action."
-                    ),
-                })
-                if redundant >= 3:
-                    console.print("[yellow]Repeated actions without progress; moving to evaluation.[/yellow]")
-                    self.log.warning("No-progress loop detected at step %d; aborting phase", step)
-                    self._audit("no_progress_abort", step=step, tool=call.name, redundant=redundant)
-                    self.emit("no_progress", step=step, tool=call.name, redundant=redundant)
-                    self._no_progress_abort = True
-                    break
-            else:
-                seen[sig] = self._mutations
-
-            if result.is_final:
-                if self.lsp:
-                    await self.lsp.await_diagnostics(timeout=2.0)
-                    has_errors = False
-                    for client in getattr(self.lsp, "_clients", {}).values():
-                        for diags in client.diagnostics.values():
-                            if any(d.get("severity", 3) == 1 for d in diags):
-                                has_errors = True
-                                break
-                        if has_errors:
-                            break
-                    if has_errors:
-                        diagnostics_text = self.lsp.get_all_diagnostics()
-                        console.print(f"[yellow]Blocked finish: compiler diagnostics reported errors[/yellow]")
-                        self.frame.messages.append({
-                            "role": "user",
-                            "content": (
-                                "Wait, you cannot finish yet. There are compile/lint errors in the workspace:\n"
-                                f"{diagnostics_text}\n"
-                                "Please read the files, fix these errors, and only then call finish."
-                            )
-                        })
-                        result.is_final = False
-                        result.ok = False
-                        result.content = f"Blocked finish: compiler diagnostics reported errors:\n{diagnostics_text}"
-                        continue
-
-                # Blocking finish here, not only at evaluation, is the point.
-                # Evaluation alone caught the omission but could not repair it:
-                # reflexion correctly diagnosed "create the missing __init__.py
-                # files", handed that lesson back, and the executor called finish
-                # again immediately -- because the suite was green and green is
-                # its finish criterion. Three retries burned without a single
-                # write. The executor has to be stopped where it tries to leave.
-                missing = self._missing_requested_files()
-                if missing:
-                    console.print(f"[yellow]Blocked finish: {len(missing)} requested file(s) missing[/yellow]")
-                    self.frame.messages.append({
-                        "role": "user",
-                        "content": (
-                            "Wait, you cannot finish yet. The task asked for these files "
-                            "and they do not exist:\n"
-                            + "\n".join(f"  - {m}" for m in missing)
-                            + "\nCreate each one with write_file now. An empty file is fine "
-                              "for __init__.py. The tests already pass, so do not change any "
-                              "existing code -- only add the missing files, then call finish."
-                        )
-                    })
-                    result.is_final = False
-                    result.ok = False
-                    result.content = "Blocked finish: missing requested files: " + ", ".join(missing)
-                    continue
-                self.frame.metadata["finish_summary"] = result.content
-                break
-        self.fsm.transition("execution_done")
-
-    def _missing_requested_files(self) -> list[str]:
-        """Files the task named explicitly that were never created.
-
-        A green suite does not mean the task was done. Asked for 11 files across
-        nested packages, the agent delivered 8, declared success, and pytest
-        agreed -- because PEP 420 namespace packages import fine without
-        __init__.py, so the three missing ones were invisible until packaging
-        broke far away from the cause. Tests check behaviour; nothing checked
-        that what was asked for actually exists.
-
-        Deliberately conservative: only paths that look like real files (a slash
-        or a known source suffix) and that the task states outright. A task that
-        names no files yields no findings.
-        """
-        import re
-        text = getattr(self.frame, "task_description", "") or ""
-        # Strip URLs first: the tokenizer below splits on ':', so a bare
-        # "http" prefix check never sees "//example.com/guide.py" and would
-        # report a documentation link as a missing file.
-        text = re.sub(r"\w+://\S+|\bwww\.\S+", " ", text)
-        SUFFIXES = (".py", ".js", ".ts", ".go", ".rs", ".java", ".rb", ".c", ".h",
-                    ".cpp", ".json", ".yaml", ".yml", ".toml", ".md", ".txt", ".cfg")
-        candidates = set()
-        for token in re.findall(r"[\w./-]+", text):
-            token = token.strip(".,;:")
-            if not token.endswith(SUFFIXES):
-                continue
-            if "/" not in token and not token.endswith(".py"):
-                continue          # a bare "notes.md" is usually prose, not a path
-            if token.startswith(("/", "..")) or ".." in token:
-                continue
-            candidates.add(token)
-        missing = []
-        for rel in sorted(candidates):
-            try:
-                if not (self.workspace / rel).exists():
-                    missing.append(rel)
-            except (OSError, ValueError):
-                continue
-        return missing
-
-    async def _evaluation_step(self) -> None:
-        # Run tests/compile off the event loop so a long suite doesn't block it.
-        result = await asyncio.to_thread(self.evaluator.evaluate, self.workspace)
-        if result.passed:
-            missing = self._missing_requested_files()
-            if missing:
-                # Name them, and say what to do -- a bare "incomplete" sends the
-                # model rewriting code that was already correct.
-                result = replace(
-                    result,
-                    passed=False,
-                    summary=(
-                        "Tests pass, but the task asked for files that do not exist: "
-                        + ", ".join(missing)
-                        + ". Create exactly these files. Do not modify the code that "
-                        "is already passing."
-                    ),
-                )
-        if result.passed and self._no_progress_abort and self._mutations == 0:
-            # The loop detector bailed and not one edit landed, yet the suite is
-            # green — because it was green before we started. That is a stalled
-            # run wearing a success's clothes; refuse to certify it.
-            result = replace(
-                result,
-                passed=False,
-                summary=(
-                    "Tests pass, but the agent stopped making progress without editing "
-                    "any file — the suite was already green before the task began, so "
-                    "it proves nothing here. Treating this as failure, not success."
-                ),
-            )
-        style = "green" if result.passed else "red"
-        console.print(Panel(escape(result.summary), title="Evaluation", border_style=style))
-        self.log.info("Evaluation passed=%s: %s", result.passed, result.summary)
-        self._audit(
-            "evaluation", passed=result.passed,
-            summary=result.summary, ran_tests=result.ran_tests,
-        )
-        self.emit("evaluation", passed=result.passed, summary=result.summary)
-        if result.passed:
-            self.fsm.transition("passed")
-        else:
-            self.frame.last_error_summary = result.summary
-            self.frame.metadata["last_eval"] = result
-            self.fsm.transition("failed")
-
-    async def _maybe_escalate(self) -> Optional[str]:
-        """Ask a human for a hint once, when the retry budget is exhausted."""
-        if self._escalation_callback is None or self.frame.metadata.get("escalated"):
-            return None
-        self.frame.metadata["escalated"] = True
-        summary = self.frame.last_error_summary or "The change repeatedly failed evaluation."
-        eval_result = self.frame.metadata.get("last_eval")
-        details = (getattr(eval_result, "details", "") or "")[:2000]
-        console.print("[yellow]Escalating to a human for a hint...[/yellow]")
-        self.log.info("Escalating to human after %d retries", self.frame.retry_count)
-        self._audit("escalation_requested", summary=summary)
         try:
-            hint = await self._escalation_callback(f"{summary}\n\n{details}".strip())
-        except Exception as exc:  # never let escalation crash the run
-            self.log.warning("Escalation failed: %s", exc)
-            return None
-        return (hint or "").strip() or None
-
-    async def _reflexion_step(self) -> None:
-        if self.frame.retry_count >= self.frame.max_retries:
-            hint = await self._maybe_escalate()
-            if hint:
-                self.frame.add_reflection(f"Human hint: {hint}")
-                self.frame.messages.append({
-                    "role": "user",
-                    "content": (
-                        f"A human operator reviewed the failures and provided this hint: "
-                        f"{hint}\nUse it to fix the code, then call finish."
-                    ),
-                })
-                # Grant one more round of attempts.
-                self.frame.max_retries += max(1, self.frame.max_retries)
-                self._audit("escalation_hint", hint=hint[:500])
-                # A human hint is high-value — remember it for future runs.
-                self.memory.add(hint, kind="lesson", task=self.frame.task_description)
-                self.emit("escalation_resolved", hint=hint)
-                self.fsm.transition("retry")
-                return
-            console.print("[yellow]Retry budget exhausted.[/yellow]")
-            self.log.info("Retry budget exhausted after %d retries", self.frame.retry_count)
-            self._audit("give_up", retries=self.frame.retry_count)
-            # Why the run ended is the most important thing about a failed run, so it
-            # must reach every surface — not just the console. Without this emit, a
-            # dashboard or editor client shows a bare "error" with no reason.
-            self.emit("give_up", retries=self.frame.retry_count,
-                      summary=self.frame.last_error_summary or "")
-            self.fsm.transition("give_up")
+            baseline = self.evaluator.evaluate(self.config.workspace)
+            self.runtime.baseline_green = bool(baseline.passed and baseline.ran_tests)
+        except Exception as exc:
+            self.log.warning("Could not capture a green baseline: %s", exc)
+            self.runtime.baseline_green = False
             return
-        self.frame.retry_count += 1
-        eval_result = self.frame.metadata.get("last_eval")
-        lesson = await self.reflexion.reflect(self.frame.task_description, eval_result) if eval_result else ""
-        self.log.info("Reflexion retry %d: %s", self.frame.retry_count, lesson[:200])
-        self._audit("reflexion", retry=self.frame.retry_count, lesson=lesson[:500])
-        self.emit("reflexion", retry=self.frame.retry_count, lesson=lesson)
-        if lesson:
-            self.frame.add_reflection(lesson)
+        if self.runtime.baseline_green:
+            self.log.info("Suite already green before this run; stop-when-green disabled.")
+            self.event_bus.emit("baseline_green", disabled_stop_when_green=True)
 
-        if self.planner_editor and eval_result:
-            checklist = self.frame.metadata.get("checklist") or []
-            modified_paths = [item.get("path") for item in checklist if item.get("path")]
-            impacted_tests = self.find_impacted_tests(modified_paths)
+    # ---- private: FSM drive ----
 
-            refiner_msgs = prompts.planner_refiner_messages(
-                task=self.frame.task_description,
-                checklist=checklist,
-                eval_result=str(eval_result),
-                lesson=lesson,
-                impacted_tests=impacted_tests
-            )
-            try:
-                response = await self._model_turn(refiner_msgs, label="Refining Checklist...")
-                refined_text = response.content.strip()
-                import re
-                json_match = re.search(r"```json\s*(.*?)\s*```", refined_text, re.DOTALL)
-                if json_match:
-                    refined_text = json_match.group(1).strip()
-                elif refined_text.startswith("```") and refined_text.endswith("```"):
-                    refined_text = refined_text.strip("`").strip()
-                
-                import json
-                refined_checklist = json.loads(refined_text)
-                if isinstance(refined_checklist, list) and len(refined_checklist) > 0:
-                    for task in refined_checklist:
-                        if isinstance(task, dict) and task.get("path"):
-                            target_file = self.workspace / task["path"]
-                            if target_file.exists():
-                                task["is_new"] = False
-                    self.frame.metadata["checklist"] = refined_checklist
-                    self.frame.plan = json.dumps(refined_checklist, indent=2)
-                    self.log.info("Refined checklist created with %d tasks", len(refined_checklist))
-                    self.emit("plan", text=self.frame.plan)
-            except Exception as exc:
-                self.log.warning("Failed to refine checklist: %s. Re-running original checklist.", exc)
-            self.frame.messages.append(
-                {"role": "user", "content": f"The change failed evaluation. {lesson} Fix it and call finish."}
-            )
-        self.fsm.transition("retry")
+    async def _check_model_availability(self) -> bool:
+        if not await self.model.is_available():
+            OrchestratorDisplay.display_model_unavailable(self.model.host)
+            self.log.error("Ollama not reachable at %s", self.model.host)
+            self.audit.record("model_unavailable", host=self.model.host)
+            self.fsm.transition("start")
+            self.fsm.transition("error")
+            return False
+        return True
 
-    # -- helpers -------------------------------------------------------------
+    async def _handle_stop_or_pause(self) -> bool:
+        if self.runtime.stopped:
+            self.log.info("Run stopped by user request")
+            self.event_bus.emit("run_stopped", reason="User request")
+            if self.fsm.can("error"):
+                self.fsm.transition("error")
+            else:
+                self.fsm.state = AgentState.ERROR
+            return True
+        if self.runtime.paused:
+            self.log.info("Run paused. Waiting for resume...")
+            self.event_bus.emit("run_paused")
+            await self.runtime.paused_event.wait()
+            self.log.info("Run resumed.")
+            self.event_bus.emit("run_resumed")
+            if self.runtime.stopped:
+                return True
+        return False
+
+    async def _execute_state(self, state: AgentState) -> None:
+        if state == AgentState.PLANNING:
+            await self.planner_agent.execute()
+        elif state == AgentState.EXECUTING:
+            await self.coder_agent.execute()
+        elif state == AgentState.EVALUATING:
+            await self.reviewer_agent.execute_evaluation()
+        elif state == AgentState.REFLEXING:
+            await self.reviewer_agent.execute_reflexion()
+        else:
+            self.log.warning("Unknown state: %s", state)
+
+    async def _model_turn(self, messages, tools=None, label: str = "") -> Any:
+        """Call the model — delegates to ModelService."""
+        return await self.model_service.turn(messages, tools, label=label, stream=self.runtime.stream)
+
     async def _handle_error(self, error: Exception) -> None:
         metrics = self.model_circuit.get_metrics()
         if isinstance(error, TransientError):
-            console.print(f"[yellow]Transient error ({error}). Circuit: {metrics['state']}[/yellow]")
+            OrchestratorDisplay.print_transient_error(error, metrics)
         else:
-            console.print(f"[bold red]Error:[/bold red] {error}")
-        # A TransientError is an *expected* operational failure — the model server went
-        # away — and the console has already said so in one line. Dumping 30 lines of
-        # httpx internals on top of it buries the message and reads like a crash, when
-        # the agent in fact handled it exactly as designed. Keep the traceback for the
-        # unexpected errors, where it is the only clue you get.
-        self.log.error(
-            "Error in state %s: %s", self.fsm.state.value, error,
-            exc_info=not isinstance(error, TransientError),
-        )
-        self._audit(
-            "error", state=self.fsm.state.value, error=str(error),
-            error_type=type(error).__name__, circuit=metrics["state"],
-        )
+            OrchestratorDisplay.print_error(error)
+        self.log.error("Error in state %s: %s", self.fsm.state.value, error,
+                        exc_info=not isinstance(error, TransientError))
+        self.audit.record("error", state=self.fsm.state.value, error=str(error),
+                          error_type=type(error).__name__, circuit=metrics["state"])
         if self.fsm.can("error"):
             self.fsm.transition("error")
-        else:  # already terminal or unexpected state
+        else:
             self.fsm.state = AgentState.ERROR
 
     def _finalize(self) -> None:
-        try:
-            self.sandbox.stop()
-        finally:
-            self._print_stats()
-            state = self.fsm.state.value
-            self.log.info("Task end in state=%s retries=%d", state, self.frame.retry_count)
-            self._audit(
-                "task_end", final_state=state, retries=self.frame.retry_count,
-                **self.stats.as_dict(),
-            )
-            self.emit(
-                "run_finished",
-                final_state=state,
-                summary=self.frame.metadata.get("finish_summary", ""),
-                stats=self.stats.as_dict(),
-            )
-            console.print(f"[bold]Session ended in state:[/bold] {state}")
+        self._state = OrchestratorState.FINALIZING
+        OrchestratorDisplay.print_stats(self.stats, self.run_id, self.model_name, self.model_circuit)
+        state = self.fsm.state.value
+        self.log.info("Task end in state=%s retries=%d", state, self.frame.retry_count)
+        self.audit.record("task_end", final_state=state, retries=self.frame.retry_count,
+                          **self.stats.as_dict())
+        if state != AgentState.DONE.value and self.stats.model_calls > 0:
+            try:
+                report = OrchestratorDisplay.write_handoff_report(
+                    workspace=self.workspace, run_id=self.run_id, model_name=self.model_name,
+                    state=state, retry_count=self.frame.retry_count,
+                    max_retries=self.frame.max_retries,
+                    last_error_summary=self.frame.last_error_summary or "",
+                    eval_result=self.frame.metadata.get("last_eval"),
+                    reflections=self.frame.reflections,
+                    missing_files=self._missing_requested_files(), log=self.log,
+                )
+                if report:
+                    self.frame.metadata["partial_report"] = report
+                    self.audit.record("handoff_written", state=state, retries=self.frame.retry_count)
+            except Exception:
+                self.log.debug("handoff report generation failed", exc_info=True)
+        self.event_bus.emit("run_finished", final_state=state,
+                            summary=self.frame.metadata.get("finish_summary", ""),
+                            stats=self.stats.as_dict())
+        OrchestratorDisplay.print_session_ended(state)
+        self._state = OrchestratorState.COMPLETED
 
-    def _print_stats(self) -> None:
-        s = self.stats
-        if s.model_calls == 0:
-            return
-        table = Table(title="Run summary", show_header=False, title_style="bold")
-        table.add_row("Run id", self.run_id)
-        table.add_row("Model", self.model_name)
-        table.add_row("Model calls", str(s.model_calls))
-        table.add_row("Prompt tokens", f"{s.prompt_tokens:,}")
-        table.add_row("Completion tokens", f"{s.completion_tokens:,}")
-        table.add_row("Total tokens", f"{s.total_tokens:,}")
-        table.add_row("Model time", f"{s.total_seconds:.1f}s")
-        table.add_row("Throughput", f"{s.tokens_per_second:.1f} tok/s")
-        table.add_row("Circuit", self.model_circuit.get_metrics()["state"])
-        console.print(table)
+    def _write_handoff_report(self, state: str) -> None:
+        """Backward-compatible handoff report (delegates to OrchestratorDisplay)."""
+        report = OrchestratorDisplay.write_handoff_report(
+            workspace=self.workspace, run_id=self.run_id, model_name=self.model_name,
+            state=state, retry_count=self.frame.retry_count, max_retries=self.frame.max_retries,
+            last_error_summary=self.frame.last_error_summary or "",
+            eval_result=self.frame.metadata.get("last_eval"),
+            reflections=self.frame.reflections,
+            missing_files=self._missing_requested_files(), log=self.log,
+        )
+        if report:
+            self.frame.metadata["partial_report"] = report
 
-    def pause(self) -> None:
-        """Pause execution at the next checkpoint."""
-        self._paused = True
-        self._paused_event.clear()
+    # ---- public utility delegates ----
 
-    def resume(self) -> None:
-        """Resume execution."""
-        self._paused = False
-        self._paused_event.set()
+    def _audit(self, action: str, **fields) -> None:
+        self.audit.record(action, **fields)
 
-    def stop(self) -> None:
-        """Stop execution immediately at the next checkpoint."""
-        self._stopped = True
-        self._paused_event.set()
+    def emit(self, event: str, **data) -> None:
+        self.event_bus.emit(event, **data)
 
-    def _find_test_files(self) -> list[str]:
-        test_files = []
-        for pattern in ("test_*.py", "*_test.py"):
-            for p in self.workspace.rglob(pattern):
-                parts = p.relative_to(self.workspace).parts
-                if any(x in parts for x in (".venv", "venv", "__pycache__", ".git")):
-                    continue
-                test_files.append(p.relative_to(self.workspace).as_posix())
-        return test_files
+    def _missing_requested_files(self) -> List[str]:
+        task = getattr(self.frame, "task_description", "") or ""
+        workspace = getattr(self, "config", getattr(self, "workspace", None))
+        if hasattr(workspace, "workspace"):
+            workspace = workspace.workspace
+        if not workspace:
+            return []
+        return TaskAnalyzer.extract_requested_files(task, workspace)
 
     def _find_target_file(self) -> Optional[str]:
-        solution_path = self.workspace / "solution.py"
-        if solution_path.exists():
-            return "solution.py"
+        return FileSystemHelper.find_target_file(self.config.workspace)
 
-        candidates = []
-        extensions = ("*.py", "*.js", "*.ts", "*.go", "*.rs", "*.java", "*.cpp", "*.c", "*.h")
-        for ext in extensions:
-            for p in self.workspace.rglob(ext):
-                parts = p.relative_to(self.workspace).parts
-                if any(x in parts for x in (".venv", "venv", "__pycache__", ".git", "node_modules", "target")):
-                    continue
-                name_lower = p.name.lower()
-                if "test" in name_lower or "spec" in name_lower:
-                    continue
-                candidates.append(p.relative_to(self.workspace).as_posix())
-
-        if len(candidates) == 1:
-            return candidates[0]
-        return None
-
-    def _extract_implicit_code(self, text: str, is_py: bool) -> Optional[str]:
-        import re
-        import ast
-
-        text_stripped = text.strip()
-        if not text_stripped:
-            return None
-
-        # 1. Try to extract fenced code blocks first
-        fenced_pattern = re.compile(r"```([a-zA-Z0-9+#-]*)?\s*\n?(.*?)\n?\s*```", re.DOTALL)
-        fenced_blocks = []
-        for lang, code in fenced_pattern.findall(text):
-            lang = (lang or "").strip().lower()
-            if lang in ("json", "tool_call", "tool", "tool_name"):
-                continue
-            fenced_blocks.append(code.strip())
-
-        if fenced_blocks:
-            return "\n\n".join(fenced_blocks)
-
-        # 2. If it is Python, check if we can extract bare code using AST validation
-        if is_py:
-            try:
-                ast.parse(text_stripped)
-                return text_stripped
-            except SyntaxError:
-                pass
-
-            # Try to find the first line starting with a python keyword
-            lines = text.splitlines()
-            start_idx = -1
-            for idx, line in enumerate(lines):
-                stripped = line.strip()
-                if stripped.startswith(("def ", "async def ", "class ", "import ", "from ")):
-                    start_idx = idx
-                    break
-
-            if start_idx != -1:
-                candidate_code = "\n".join(lines[start_idx:])
-                try:
-                    ast.parse(candidate_code.strip())
-                    return candidate_code.strip()
-                except SyntaxError:
-                    # Strip lines from the bottom one-by-one to remove trailing prose
-                    cand_lines = candidate_code.splitlines()
-                    while len(cand_lines) > 1:
-                        cand_lines.pop()
-                        try:
-                            ast.parse("\n".join(cand_lines).strip())
-                            return "\n".join(cand_lines).strip()
-                        except SyntaxError:
-                            continue
-                    return candidate_code.strip()
-
-        return None
+    def _extract_implicit_code(self, text: str, is_py: bool = False) -> Optional[str]:
+        return CodeExtractor.extract_implicit_code(text, is_py)
 
     def _relevant_test_content(self, path: str, limit: int = 6000) -> str:
-        """The test file that exercises `path`, so the editor sees the exact spec.
-
-        Without the test in context, the editor guesses the exact strings and
-        values the test asserts on — the dominant remaining failure mode (e.g.
-        writing 'Graph item is malformed' when the test requires 'Node is
-        malformed'). The bare model passes these when the test is in its prompt;
-        the agent's editor never received it. We only *read* the test here; the
-        editor is still told not to modify it. Skips when `path` is itself a test.
-        """
         try:
             name = Path(path).name.lower()
             if "test" in name or "spec" in name:
-                return ""
-            stem = Path(path).stem
-            skip = {".venv", "venv", "__pycache__", ".git", "node_modules", "target"}
-            # Prefer the test whose name matches this file; else any test file
-            # (single-file tasks have exactly one).
-            preferred = [self.workspace / f"{stem}_test.py", self.workspace / f"test_{stem}.py"]
-            others = [
-                p for pat in ("*_test.py", "test_*.py")
-                for p in sorted(self.workspace.rglob(pat))
-                if not (set(p.relative_to(self.workspace).parts) & skip)
-            ]
-            for cand in preferred + others:
-                if cand.exists():
-                    text = cand.read_text(encoding="utf-8", errors="replace")
-                    if len(text) > limit:
-                        text = text[:limit] + "\n# ...(test truncated)..."
-                    return text
+                # For test files, provide the implementation code they likely import
+                # so the model can write tests that match the actual API
+                impl_content = self._get_implementation_for_test(path, limit)
+                return impl_content
+            test_path = FileSystemHelper.find_relevant_test(self.config.workspace, path)
+            if test_path and test_path.exists():
+                text = test_path.read_text(encoding="utf-8", errors="replace")
+                if len(text) > limit:
+                    text = text[:limit] + "\n# ...(test truncated)..."
+                return text
             return ""
         except Exception as e:
             self.log.warning("Could not load test content for %s: %s", path, e)
             return ""
 
+    def _get_implementation_for_test(self, test_path: str, limit: int = 6000) -> str:
+        """When writing a test file, find and return the implementation code it imports."""
+        try:
+            workspace = self.config.workspace
+            # Parse the test file to find imports from src/
+            test_file = workspace / test_path
+            if not test_file.exists():
+                return ""
+            tree = ast.parse(test_file.read_text(encoding="utf-8", errors="replace"))
+            impl_files: List[str] = []
+            seen: set = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    mod = node.module
+                    # Convert module path to file path
+                    parts = mod.split(".")
+                    for depth in range(len(parts), 0, -1):
+                        sub = "/".join(parts[:depth])
+                        # Try multiple base locations: workspace root, src/, and workspace/src/
+                        for base in [workspace, workspace / "src"]:
+                            candidate = base / (sub + ".py")
+                            if candidate.exists():
+                                rel = str(candidate.relative_to(workspace))
+                                if rel not in seen:
+                                    seen.add(rel)
+                                    impl_files.append(rel)
+                            init = base / sub / "__init__.py"
+                            if init.exists():
+                                rel = str(init.relative_to(workspace))
+                                if rel not in seen:
+                                    seen.add(rel)
+                                    impl_files.append(rel)
+            
+            if not impl_files:
+                return ""
+            
+            # Read implementation files
+            content_parts = ["=== IMPLEMENTATION CODE (your tests must match this API) ==="]
+            total = 0
+            for impl_file in impl_files[:5]:  # cap at 5 files
+                fpath = workspace / impl_file
+                try:
+                    text = fpath.read_text(encoding="utf-8", errors="replace")
+                    if total + len(text) > limit:
+                        text = text[:limit - total] + "\n# ...(truncated)..."
+                    content_parts.append(f"\n--- {impl_file} ---\n{text}")
+                    total += len(text)
+                except Exception:
+                    pass
+            
+            return "\n".join(content_parts) if len(content_parts) > 1 else ""
+        except Exception as e:
+            self.log.warning("Could not load implementation for test %s: %s", test_path, e)
+            return ""
+
     def _is_single_file_workspace(self) -> bool:
-        candidates = []
-        extensions = ("*.py", "*.js", "*.ts", "*.go", "*.rs", "*.java", "*.cpp", "*.c", "*.h")
-        for ext in extensions:
-            for p in self.workspace.rglob(ext):
-                parts = p.relative_to(self.workspace).parts
-                if any(x in parts for x in (".venv", "venv", "__pycache__", ".git", "node_modules", "target")):
-                    continue
-                name_lower = p.name.lower()
-                if "test" in name_lower or "spec" in name_lower:
-                    continue
-                candidates.append(p)
-        return len(candidates) <= 1
+        return len(FileSystemHelper.find_source_files(self.config.workspace)) <= 1
 
     def find_impacted_tests(self, modified_paths: List[str]) -> List[str]:
-        """Find all test files impacted by changes in modified_paths (transitive closure)."""
-        impacted_tests = set()
-        visited_modules = set()
-        
-        symbol_index = self.tools._symbol_index()
-        
-        queue = []
-        for p in modified_paths:
-            path_obj = Path(p)
-            if path_obj.suffix.lower() == ".py":
-                mod_parts = list(path_obj.with_suffix("").parts)
-                mod_name = ".".join(mod_parts)
-                queue.append(mod_name)
-                visited_modules.add(mod_name)
-
-        while queue:
-            curr_mod = queue.pop(0)
-            imports = symbol_index.importers(curr_mod)
-            for imp_path, line, module in imports:
-                if any(pat in Path(imp_path).name.lower() for pat in ("test_", "_test")):
-                    impacted_tests.add(imp_path)
-                
-                imp_path_obj = Path(imp_path)
-                if imp_path_obj.suffix.lower() == ".py":
-                    imp_mod = ".".join(imp_path_obj.with_suffix("").parts)
-                    if imp_mod not in visited_modules:
-                        visited_modules.add(imp_mod)
-                        queue.append(imp_mod)
-                        
-        return sorted(list(impacted_tests))
+        return find_impacted_tests(modified_paths, self.tools._symbol_index())

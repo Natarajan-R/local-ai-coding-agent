@@ -58,8 +58,8 @@ class _EndlessModel:
 
 async def test_stop_message_ends_a_running_task(monkeypatch):
     # Force the orchestrator the server builds to use our endless fake model.
-    import agent.orchestrator as orch_mod
-    monkeypatch.setattr(orch_mod, "OllamaClient", _EndlessModel)
+    from agent.factory import ComponentFactory
+    monkeypatch.setattr(ComponentFactory, "create_model", staticmethod(lambda cfg: _EndlessModel()))
 
     ws = Path(tempfile.mkdtemp())
     (ws / "seed.py").write_text("x = 1\n")

@@ -42,10 +42,53 @@ def test_trims_and_pins_system_and_recent():
     # The two most recent messages are preserved.
     assert "RECENT assistant" in contents[-1]
     assert any("RECENT tool output" in c for c in contents)
-    # An elision marker records what was dropped.
-    assert any("omitted to fit" in c for c in contents)
+    # A digest records that earlier steps were summarized to fit.
+    assert any("summarized to fit" in c for c in contents)
     # And the result actually fits the budget.
     assert cm.total_tokens(result.messages) <= cm.budget
+
+
+def test_dropped_summary_preserves_files_and_last_error():
+    """The trim digest carries forward touched files + the most recent error signal."""
+    cm = ContextManager(max_tokens=400, response_reserve=100, keep_recent=2)
+    pad = "y" * 4000
+    msgs = [
+        _msg("system", "SYSTEM RULES"),
+        _msg("user", "PRIMER: the task and plan"),
+        _msg("assistant", '{"name":"write_file","arguments":{"path":"src/models/user.py"}}\n' + pad),
+        _msg("tool", "Wrote src/routes/auth.py\nTraceback (most recent call last):\n"
+                     "ModuleNotFoundError: No module named 'src.models.order'\n" + pad),
+        _msg("assistant", pad + "\nmore"),
+        _msg("tool", "RECENT tool output"),
+        _msg("assistant", "RECENT assistant"),
+    ]
+    result = cm.fit(msgs)
+    assert result.trimmed is True
+    digest = next(c["content"] for c in result.messages if "summarized to fit" in c["content"])
+    # Files touched in the dropped block are named...
+    assert "src/models/user.py" in digest and "src/routes/auth.py" in digest
+    # ...and the most recent error signal is carried forward.
+    assert "No module named" in digest
+    # The digest stays bounded and the whole thing fits.
+    assert len(digest) <= 800 + 4
+    assert cm.total_tokens(result.messages) <= cm.budget
+
+
+def test_dropped_summary_omits_error_line_when_none_present():
+    """No fabricated error line when the dropped steps had no error signal."""
+    cm = ContextManager(max_tokens=400, response_reserve=100, keep_recent=2)
+    pad = "y" * 4000
+    msgs = [
+        _msg("system", "SYSTEM RULES"),
+        _msg("user", "PRIMER"),
+        _msg("assistant", "wrote src/app.py cleanly " + pad),
+        _msg("tool", pad + " ok"),
+        _msg("assistant", "RECENT"),
+        _msg("tool", "RECENT2"),
+    ]
+    result = cm.fit(msgs)
+    digest = next(c["content"] for c in result.messages if "summarized to fit" in c["content"])
+    assert "test/error signal" not in digest
 
 
 def test_hard_truncate_when_head_and_tail_too_big():

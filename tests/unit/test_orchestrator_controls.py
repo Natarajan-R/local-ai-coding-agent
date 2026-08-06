@@ -1,6 +1,5 @@
 import asyncio
 import json
-import pytest
 from agent.fsm import AgentState
 from agent.orchestrator import Orchestrator
 

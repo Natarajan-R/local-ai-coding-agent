@@ -10,18 +10,23 @@ from typing import Dict, List, Tuple
 
 
 class LanguageProfile(ABC):
+    """Per-language strategy for producing skeletons and extracting symbols."""
+
     @property
     @abstractmethod
     def name(self) -> str:  # pragma: no cover - trivial
+        """Human-readable language name."""
         ...
 
     @property
     @abstractmethod
     def extensions(self) -> List[str]:  # pragma: no cover - trivial
+        """File extensions this profile handles (e.g. ``['.py']``)."""
         ...
 
     @abstractmethod
     def generate_skeleton(self, content: str) -> str:
+        """Return a signatures-only view of ``content`` with bodies elided."""
         ...
 
     def extract_symbols(self, content: str) -> List[Tuple[str, str, int]]:
@@ -38,11 +43,13 @@ class LanguageRouter:
     """
 
     def __init__(self) -> None:
+        """Build the extension-to-profile map from the default profile set."""
         self._by_ext: Dict[str, LanguageProfile] = {}
         self.treesitter = False
         self._register_defaults()
 
     def _register_defaults(self) -> None:
+        """Register the Python, tree-sitter and regex-fallback profiles."""
         # Imported here to avoid a circular import at module load time.
         from .java_driver import JavaProfile
         from .python_driver import PythonProfile
@@ -70,16 +77,20 @@ class LanguageRouter:
             self.register(ShellProfile())
 
     def register(self, profile: LanguageProfile) -> None:
+        """Map every extension of ``profile`` to it (last registration wins)."""
         for ext in profile.extensions:
             self._by_ext[ext.lower()] = profile
 
     def for_extension(self, ext: str) -> LanguageProfile | None:
+        """Return the profile handling ``ext``, or None if unsupported."""
         return self._by_ext.get(ext.lower())
 
     def supported_extensions(self) -> set[str]:
+        """Return the set of file extensions any registered profile handles."""
         return set(self._by_ext.keys())
 
     def skeleton(self, filename: str, content: str) -> str:
+        """Return the skeleton for ``content``, or the content itself if the extension is unsupported."""
         ext = "." + filename.rsplit(".", 1)[-1] if "." in filename else ""
         profile = self.for_extension(ext)
         if profile is None:

@@ -13,6 +13,8 @@ from typing import Any, Dict, Optional
 
 @dataclass
 class RunStats:
+    """Accumulated token counts and timing for one task run."""
+
     model_calls: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -33,18 +35,22 @@ class RunStats:
 
     @property
     def total_tokens(self) -> int:
+        """Prompt plus completion tokens across all calls."""
         return self.prompt_tokens + self.completion_tokens
 
     @property
     def total_seconds(self) -> float:
+        """Total model time in seconds (Ollama reports it in nanoseconds)."""
         return self.total_duration_ns / 1e9
 
     @property
     def tokens_per_second(self) -> float:
+        """Generation throughput (completion tokens / second), 0.0 if no time recorded."""
         secs = self.total_seconds
         return self.completion_tokens / secs if secs > 0 else 0.0
 
     def as_dict(self) -> Dict[str, Any]:
+        """Return the stats as a JSON-serialisable summary dict."""
         return {
             "model_calls": self.model_calls,
             "prompt_tokens": self.prompt_tokens,

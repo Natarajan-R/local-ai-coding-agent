@@ -34,11 +34,15 @@ SEARCH_MAX_FILES_SCANNED = 5000
 
 
 class WorkspaceIndexer:
+    """Builds the repository map the model sees: a file tree plus code skeletons."""
+
     def __init__(self, workspace: Path) -> None:
+        """Root the indexer at ``workspace`` and set up the language router."""
         self.workspace = Path(workspace).resolve()
         self.router = LanguageRouter()
 
     def list_files(self, directory: str | None = None) -> List[Path]:
+        """Return all files under the workspace (or ``directory``), skipping ignored dirs."""
         root = self.workspace
         if directory:
             root = (self.workspace / directory).resolve()
@@ -63,6 +67,7 @@ class WorkspaceIndexer:
         return self._overview(files)
 
     def _full_skeleton(self, files: List[Path], max_skeleton_files: int) -> str:
+        """Render the full file tree plus per-file skeletons (used for small repos)."""
         lines: List[str] = ["# Repository structure"]
         for f in files:
             rel = f.relative_to(self.workspace)
@@ -90,6 +95,7 @@ class WorkspaceIndexer:
         return "\n".join(lines)
 
     def _overview(self, files: List[Path]) -> str:
+        """Render a compact directory overview (used for large repos, explored on demand)."""
         rel_paths = [f.relative_to(self.workspace) for f in files]
         top_dir_counts: Counter = Counter()
         root_files: List[str] = []

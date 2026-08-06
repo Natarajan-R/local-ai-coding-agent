@@ -28,10 +28,13 @@ _TAG_RE = re.compile(r"<tool_call>\s*(\{.*?\}|\[.*?\])\s*</tool_call>", re.DOTAL
 
 @dataclass
 class ToolCall:
+    """A parsed tool invocation: the tool name and its argument dict."""
+
     name: str
     arguments: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
+        """Return the call as a plain ``{name, arguments}`` dict."""
         return {"name": self.name, "arguments": self.arguments}
 
 
@@ -61,7 +64,79 @@ def _repair_docstring_json(chunk: str) -> Optional[str]:
     return chunk.replace('"""', '\\"\\"\\"')
 
 
+# Common Python-to-JSON substitutions that local models make.
+_PYTHON_TO_JSON = (
+    (r'\bTrue\b', 'true'),
+    (r'\bFalse\b', 'false'),
+    (r'\bNone\b', 'null'),
+)
+
+
+def _repair_common_json(content: str) -> Optional[str]:
+    """Fix trailing commas, Python-style booleans/nulls, and unescaped quotes in f-strings.
+
+    Local models frequently emit ``{"key": "value",}`` (trailing comma) or
+    ``True``/``False``/``None`` instead of ``true``/``false``/``null``.
+    They also write Python f-strings with unescaped quotes inside JSON strings:
+    ``{"content": "f'#{product.get(\"name\")}'"}`` — the inner quotes break JSON.
+
+    This is a conservative, string-level repair that only fires when the
+    initial ``json.loads`` has already failed.
+
+    Returns the repaired text, or None if no repair was attempted.
+    """
+    import re
+    repaired = content
+    changed = False
+
+    # Replace Python booleans/nulls with JSON equivalents
+    for pattern, replacement in _PYTHON_TO_JSON:
+        new = re.sub(pattern, replacement, repaired)
+        if new != repaired:
+            changed = True
+            repaired = new
+
+    # Remove trailing commas before } or ]
+    new = re.sub(r',\s*([}\]])', r'\1', repaired)
+    if new != repaired:
+        changed = True
+        repaired = new
+
+    # Attempt to fix unescaped quotes inside f-strings/strings in JSON content fields.
+    # The model often writes: "content": "...f'#{product.get(\"name\")}'..."
+    # where the inner quotes aren't properly escaped. We try a targeted repair:
+    # find "content": "..." patterns and escape any unescaped quotes inside.
+    def _escape_inner_quotes(match):
+        prefix = match.group(1)  # e.g. "content": "
+        body = match.group(2)
+        suffix = match.group(3)  # closing "
+        # Escape any unescaped double quotes in body
+        # First unescape any already-escaped ones to avoid double-escaping
+        body_fixed = body.replace('\\"', '"')  # undo existing escapes
+        body_fixed = body_fixed.replace('\\\'', "'")  # undo escaped single quotes
+        body_fixed = body_fixed.replace('"', '\\"')  # re-escape all double quotes
+        # Also escape literal newlines that aren't already escaped
+        body_fixed = body_fixed.replace('\n', '\\n')
+        body_fixed = body_fixed.replace('\t', '\\t')
+        return prefix + body_fixed + suffix
+
+    # Match "key": "...content..." patterns where content has unescaped quotes
+    # This is a heuristic: look for "content": " or "replace": " etc.
+    content_key_re = re.compile(
+        r'("(?:content|replace|search|command|docstring)":\s*")((?:[^"\\]|\\.)*)("\s*[,}])',
+        re.DOTALL
+    )
+    new = content_key_re.sub(_escape_inner_quotes, repaired)
+    if new != repaired:
+        changed = True
+        repaired = new
+
+    return repaired if changed else None
+
+
 class ToolParser:
+    """Extracts tool calls from raw model output, tolerating fenced/loose JSON."""
+
     def parse(self, text: str) -> List[ToolCall]:
         """Return every tool call found in ``text`` (possibly empty)."""
         if not text:
@@ -84,35 +159,13 @@ class ToolParser:
                 continue
 
             try:
-                data = json.loads(content, strict=False)
-            except json.JSONDecodeError as exc1:
-                import ast
-                try:
-                    data = ast.literal_eval(content)
-                    if not isinstance(data, (dict, list)):
-                        raise ValueError("Not a dict or list literal")
-                except Exception:
-                    repaired = _repair_docstring_json(content)
-                    if repaired is None:
-                        logger.warning(
-                            "Parser dropped candidate chunk: JSON decoding failed. Error: %s. Chunk: %r",
-                            exc1, content
-                        )
-                        continue
-                    try:
-                        data = json.loads(repaired, strict=False)
-                    except json.JSONDecodeError as exc2:
-                        try:
-                            data = ast.literal_eval(repaired)
-                            if not isinstance(data, (dict, list)):
-                                raise ValueError("Not a dict or list literal")
-                        except Exception:
-                            logger.warning(
-                                "Parser dropped candidate chunk: JSON decoding failed even after docstring repair. "
-                                "Error: %s. Original: %r. Repaired: %r",
-                                exc2, content, repaired
-                            )
-                            continue
+                data = self._robust_decode(content)
+            except ValueError as exc:
+                logger.warning(
+                    "Parser dropped candidate chunk: JSON decoding failed. Error: %s. Chunk: %r",
+                    exc, content
+                )
+                continue
 
             objects = []
             if isinstance(data, list):
@@ -163,47 +216,70 @@ class ToolParser:
             args = fn.get("arguments", {})
             if isinstance(args, str):
                 try:
-                    args = json.loads(args, strict=False)
-                except json.JSONDecodeError as exc:
+                    args = self._robust_decode(args)
+                except ValueError as exc:
                     logger.warning("Native tool call arguments JSON decoding failed: %s. Raw: %r", exc, args)
                     args = {"_raw": args}
             out.append(ToolCall(name=name, arguments=args or {}))
         return out
 
+    def _robust_decode(self, content: str) -> Any:
+        """Attempt JSON decode, falling back to docstring repair and AST literal evaluation."""
+        try:
+            return json.loads(content, strict=False)
+        except json.JSONDecodeError:
+            pass
+
+        # Try common JSON repairs: trailing commas, Python booleans/None
+        repaired_common = _repair_common_json(content)
+        if repaired_common:
+            try:
+                return json.loads(repaired_common, strict=False)
+            except json.JSONDecodeError:
+                pass
+
+        # Try docstring repair
+        repaired = _repair_docstring_json(content)
+        if repaired:
+            try:
+                return json.loads(repaired, strict=False)
+            except json.JSONDecodeError:
+                pass
+                
+        # Final fallback: Python literal syntax (single quotes, trailing commas, True/False)
+        import ast
+        try:
+            return ast.literal_eval(content if not repaired else repaired)
+        except Exception as exc:
+            raise ValueError(f"All decoding strategies failed: {exc}")
+
     # -- internals -----------------------------------------------------------
     def _get_candidate_chunks(self, text: str) -> List[Dict[str, Any]]:
+        """Locate candidate JSON chunks in ``text`` (fenced blocks first, then bare objects)."""
         candidates = []
         fenced_spans = []
 
         # 1. Find fenced blocks
-        pattern = re.compile(r"```(?:json|tool_call|tool|tool_name)?\s*", re.IGNORECASE)
-        pos = 0
-        while True:
-            match = pattern.search(text, pos)
-            if not match:
-                break
-            start_content = match.end()
-            end_match = text.find("```", start_content)
-            if end_match != -1:
-                content = text[start_content:end_match].strip()
-                candidates.append({
-                    "content": content,
-                    "is_fenced": True,
-                    "is_balanced": True,
-                    "source": text[match.start():end_match+3]
-                })
-                fenced_spans.append((match.start(), end_match + 3))
-                pos = end_match + 3
-            else:
-                content = text[start_content:].strip()
-                candidates.append({
-                    "content": content,
-                    "is_fenced": True,
-                    "is_balanced": False,
-                    "source": text[match.start():]
-                })
-                fenced_spans.append((match.start(), len(text)))
-                break
+        for match in _FENCE_RE.finditer(text):
+            content = match.group(1).strip()
+            candidates.append({
+                "content": content,
+                "is_fenced": True,
+                "is_balanced": True,
+                "source": match.group(0)
+            })
+            fenced_spans.append((match.start(), match.end()))
+
+        # 1.5 Find XML-ish <tool_call> tags
+        for match in _TAG_RE.finditer(text):
+            content = match.group(1).strip()
+            candidates.append({
+                "content": content,
+                "is_fenced": True,  # Treat as fenced so bare scanner ignores it
+                "is_balanced": True,
+                "source": match.group(0)
+            })
+            fenced_spans.append((match.start(), match.end()))
 
         # 2. Find bare objects/lists
         bare_objects = self._scan_objects(text)
@@ -228,6 +304,7 @@ class ToolParser:
 
     @staticmethod
     def _scan_objects(text: str) -> List[Tuple[str, bool, int, int]]:
+        """Scan for balanced ``{...}``/``[...]`` spans, returning each with its position."""
         results = []
         i = 0
         n = len(text)
@@ -271,8 +348,8 @@ class ToolParser:
             i += 1
         return results
 
-    @staticmethod
-    def _to_call(obj: Dict[str, Any]) -> "ToolCall | None":
+    def _to_call(self, obj: Dict[str, Any]) -> "ToolCall | None":
+        """Convert a decoded JSON object into a ToolCall, or None if it isn't one."""
         name = obj.get("name") or obj.get("tool") or obj.get("tool_name")
         if not name or not isinstance(name, str):
             logger.warning(
@@ -289,8 +366,8 @@ class ToolParser:
             args = {k: v for k, v in obj.items() if k not in {"name", "tool", "tool_name"}}
         if isinstance(args, str):
             try:
-                args = json.loads(args, strict=False)
-            except json.JSONDecodeError as exc:
+                args = self._robust_decode(args)
+            except ValueError as exc:
                 logger.warning(
                     "Parser decoded string arguments as fallback but JSON parsing failed: %s. Raw: %r",
                     exc, args

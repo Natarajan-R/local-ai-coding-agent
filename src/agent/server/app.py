@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ServerConfig:
+    """Configuration for the dashboard server: model, sandbox, limits and auth."""
+
     workspace: Path
     model: str = "qwen2.5:7b"
     host: str = "http://localhost:11434"      # Ollama endpoint
@@ -43,6 +45,7 @@ def find_free_port(bind: str, port: int, tries: int = 20) -> int:
     """Return the first bindable port at or after ``port`` (avoids crash-on-in-use)."""
     for candidate in range(port, port + tries):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 sock.bind((bind, candidate))
                 return candidate
@@ -52,7 +55,10 @@ def find_free_port(bind: str, port: int, tries: int = 20) -> int:
 
 
 class AgentServer:
+    """The dashboard server: hosts the WebSocket API and drives an Orchestrator run."""
+
     def __init__(self, config: ServerConfig) -> None:
+        """Set up the broadcaster, approval/hint brokers and (if required) a session token."""
         self.config = config
         self.broadcaster = Broadcaster()
         self.approvals = ApprovalBroker(self.broadcaster)
@@ -64,6 +70,7 @@ class AgentServer:
 
     # -- app -----------------------------------------------------------------
     def build_app(self):
+        """Build the aiohttp application with the index, health and WebSocket routes."""
         from aiohttp import web
 
         app = web.Application()
@@ -74,19 +81,25 @@ class AgentServer:
 
     @property
     def public_config(self) -> Dict[str, Any]:
+        """The non-sensitive config sent to browser clients on connect."""
         return {
-            "workspace": str(self.config.workspace),
+            # Absolute: a client (the VS Code extension, another machine's browser)
+            # cannot resolve a path that is relative to *this* process's cwd, and it
+            # needs the real root to show which files the agent can actually touch.
+            "workspace": str(Path(self.config.workspace).resolve()),
             "model": self.config.model,
             "sandbox": self.config.sandbox_backend,
             "interactive": self.config.interactive,
         }
 
     async def _index(self, request):
+        """Serve the single-page dashboard HTML."""
         from aiohttp import web
 
         return web.Response(text=INDEX_HTML, content_type="text/html")
 
     async def _health(self, request):
+        """Return a JSON health probe (status, whether a run is active, client count)."""
         from aiohttp import web
 
         return web.json_response(
@@ -94,6 +107,7 @@ class AgentServer:
         )
 
     async def _websocket(self, request):
+        """Handle a dashboard WebSocket: authenticate, stream events out, and read control messages."""
         from aiohttp import web
 
         # Require the session token (unless auth is disabled). The dashboard page
@@ -110,6 +124,7 @@ class AgentServer:
         await ws.send_json({"event": "connected", "config": self.public_config})
 
         async def pump() -> None:
+            """Forward broadcast events from the subscription queue to this socket."""
             try:
                 while True:
                     event = await queue.get()
@@ -135,6 +150,7 @@ class AgentServer:
 
     # -- client messages -----------------------------------------------------
     async def _on_client_message(self, data: Dict[str, Any]) -> None:
+        """Dispatch an inbound control message (run/approval/hint/pause/resume/stop)."""
         kind = data.get("type")
         if kind == "run":
             await self._start_run(data.get("task", ""), data.get("options", {}))
@@ -153,6 +169,7 @@ class AgentServer:
                 self._orchestrator.stop()
 
     async def _start_run(self, task: str, options: Dict[str, Any]) -> None:
+        """Validate there's no active run and a non-empty task, then launch ``_run`` as a task."""
         if self._running:
             self.broadcaster.publish({"event": "error", "message": "A run is already in progress."})
             return
@@ -163,6 +180,7 @@ class AgentServer:
         asyncio.create_task(self._run(task, options))
 
     async def _run(self, task: str, options: Dict[str, Any]) -> None:
+        """Build an Orchestrator wired to the browser approval/hint brokers and run the task."""
         cfg = self.config
         interactive = bool(options.get("interactive", cfg.interactive))
         model = options.get("model") or cfg.model

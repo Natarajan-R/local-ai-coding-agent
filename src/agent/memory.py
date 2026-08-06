@@ -27,6 +27,8 @@ KINDS = ("convention", "lesson", "preference", "note")
 
 @dataclass
 class MemoryEntry:
+    """One remembered fact: a kind-tagged note with an id, timestamp and source task."""
+
     id: str
     kind: str
     text: str
@@ -38,14 +40,19 @@ class MemoryStore:
     """Append-only, de-duplicated project memory."""
 
     def __init__(self, workspace: Path, enabled: bool = True, filename: str = "memory.jsonl") -> None:
+        """Point the store at ``<workspace>/.ai-agent/<filename>`` (created on first write)."""
         self.enabled = enabled
         self.dir = Path(workspace).resolve() / ".ai-agent"
         self.path = self.dir / filename
+        self._entries: Optional[List[MemoryEntry]] = None
 
     # -- io ------------------------------------------------------------------
     def load(self) -> List[MemoryEntry]:
+        """Read all stored entries, skipping blank or malformed lines."""
         if not self.enabled or not self.path.exists():
             return []
+        if self._entries is not None:
+            return self._entries.copy()
         entries: List[MemoryEntry] = []
         for line in self.path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -60,10 +67,12 @@ class MemoryStore:
                 ))
             except (json.JSONDecodeError, TypeError):
                 continue
-        return entries
+        self._entries = entries
+        return entries.copy()
 
     @staticmethod
     def _norm(text: str) -> str:
+        """Normalise text (lowercase, collapse whitespace) for duplicate detection."""
         return " ".join((text or "").lower().split())
 
     def add(self, text: str, kind: str = "note", task: Optional[str] = None) -> Optional[MemoryEntry]:
@@ -83,16 +92,21 @@ class MemoryStore:
         self.dir.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(asdict(entry)) + "\n")
+        if self._entries is not None:
+            self._entries.append(entry)
         logger.info("Remembered [%s]: %s", kind, text[:80])
         return entry
 
     def clear(self) -> int:
+        """Delete the memory file and return how many entries were removed."""
         n = len(self.load())
         if self.path.exists():
             self.path.unlink()
+        self._entries = None
         return n
 
     def count(self) -> int:
+        """Return the number of stored memory entries."""
         return len(self.load())
 
     # -- recall --------------------------------------------------------------

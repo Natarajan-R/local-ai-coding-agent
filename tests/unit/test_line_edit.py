@@ -74,7 +74,9 @@ def test_apply_line_edit_not_found():
     )
     with pytest.raises(ToolError) as exc:
         apply_line_edit(content, start_line=2, end_line=2, search="non-existent", replace="modified")
-    assert "not found anywhere" in str(exc.value)
+    # Asserts the refusal, not its wording -- the message now also reports the nearest
+    # real text (see tests/unit/test_edit_miss_recovery.py) and will keep evolving.
+    assert "not found" in str(exc.value)
 
 
 def test_apply_line_edit_ambiguous_in_window():

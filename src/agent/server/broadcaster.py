@@ -18,17 +18,21 @@ class Broadcaster:
     """
 
     def __init__(self) -> None:
+        """Start with no subscribers."""
         self._queues: Set[asyncio.Queue] = set()
 
     def subscribe(self) -> asyncio.Queue:
+        """Register and return a new queue that will receive published events."""
         queue: asyncio.Queue = asyncio.Queue()
         self._queues.add(queue)
         return queue
 
     def unsubscribe(self, queue: asyncio.Queue) -> None:
+        """Remove a previously subscribed queue."""
         self._queues.discard(queue)
 
     def publish(self, event: Dict[str, Any]) -> None:
+        """Push ``event`` onto every subscribed queue (non-blocking)."""
         for queue in list(self._queues):
             try:
                 queue.put_nowait(event)
@@ -37,6 +41,7 @@ class Broadcaster:
 
     @property
     def client_count(self) -> int:
+        """Number of currently subscribed clients."""
         return len(self._queues)
 
 
@@ -48,11 +53,13 @@ class ApprovalBroker:
     """
 
     def __init__(self, broadcaster: Broadcaster, timeout: float = 300.0) -> None:
+        """Bind to a broadcaster and set the decision timeout (default deny after it)."""
         self._broadcaster = broadcaster
         self._timeout = timeout
         self._pending: Dict[str, asyncio.Future] = {}
 
     async def request(self, action: str, detail: str) -> bool:
+        """Publish an approval request and await the browser's decision (deny on timeout)."""
         req_id = uuid.uuid4().hex[:8]
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[req_id] = future
@@ -68,6 +75,7 @@ class ApprovalBroker:
             self._pending.pop(req_id, None)
 
     def resolve(self, req_id: str, approved: bool) -> bool:
+        """Fulfil a pending approval by id; return True if one was waiting."""
         future = self._pending.get(req_id)
         if future is not None and not future.done():
             future.set_result(bool(approved))
@@ -75,6 +83,7 @@ class ApprovalBroker:
         return False
 
     def as_callback(self) -> Callable[[str, str], Awaitable[bool]]:
+        """Return ``request`` as the async approval callback the registry expects."""
         return self.request
 
 
@@ -82,11 +91,13 @@ class HintBroker:
     """Ask the browser for a free-text hint when the agent escalates."""
 
     def __init__(self, broadcaster: Broadcaster, timeout: float = 600.0) -> None:
+        """Bind to a broadcaster and set how long to wait for a hint before giving up."""
         self._broadcaster = broadcaster
         self._timeout = timeout
         self._pending: Dict[str, asyncio.Future] = {}
 
     async def request(self, context: str) -> Optional[str]:
+        """Publish an escalation request and await a hint (None on timeout or empty)."""
         req_id = uuid.uuid4().hex[:8]
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[req_id] = future
@@ -103,6 +114,7 @@ class HintBroker:
             self._pending.pop(req_id, None)
 
     def resolve(self, req_id: str, hint: Optional[str]) -> bool:
+        """Fulfil a pending hint request by id; return True if one was waiting."""
         future = self._pending.get(req_id)
         if future is not None and not future.done():
             future.set_result(hint or "")

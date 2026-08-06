@@ -36,6 +36,8 @@ DEFAULT_DENY_PATTERNS: List[str] = STRUCTURAL_DENY_PATTERNS + [
 
 @dataclass
 class CommandDecision:
+    """The verdict on a command: whether it's allowed and why."""
+
     allowed: bool
     reason: str = ""
     requires_approval: bool = False
@@ -48,10 +50,12 @@ class CommandGuard:
     deny_patterns: List[str] = field(default_factory=lambda: list(DEFAULT_DENY_PATTERNS))
 
     def __post_init__(self) -> None:
+        """Pre-compile the deny-list and structural-hazard regexes."""
         self._deny = [re.compile(p) for p in self.deny_patterns]
         self._structural = [re.compile(p) for p in STRUCTURAL_DENY_PATTERNS]
 
     def check(self, command: str) -> CommandDecision:
+        """Evaluate a command via the AST guard (or regex fallback) and return the decision."""
         text = (command or "").strip()
         if not text:
             return CommandDecision(False, "Empty command")
@@ -86,4 +90,5 @@ class CommandGuard:
         return CommandDecision(True, "ok")
 
     def is_allowed(self, command: str) -> bool:
+        """Convenience wrapper returning only the boolean verdict from ``check``."""
         return self.check(command).allowed

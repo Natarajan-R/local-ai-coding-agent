@@ -19,6 +19,7 @@ BENCH_DIR = Path(__file__).resolve().parents[3] / "benchmarks" / "tasks"
 
 
 def _load_tasks() -> List[tuple[str, object]]:
+    """Import every ``benchmarks/tasks/*.py`` that defines a TASK and check()."""
     tasks: List[tuple[str, object]] = []
     if not BENCH_DIR.exists():
         return tasks
@@ -36,6 +37,7 @@ def _load_tasks() -> List[tuple[str, object]]:
 
 
 def run_benchmarks(workspace: Path, model: str, task_name: str | None = None, planner_editor: bool = False, max_retries: int = 2, num_ctx: int = 16384) -> None:
+    """Run the bundled benchmark tasks (or those matching ``task_name``) and print a pass/fail table."""
     import fnmatch
     tasks = _load_tasks()
     

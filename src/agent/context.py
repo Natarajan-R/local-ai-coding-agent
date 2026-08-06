@@ -15,8 +15,9 @@ which is conservative enough for budgeting without pulling in a tokenizer.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Set
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +26,21 @@ PER_MESSAGE_OVERHEAD_TOKENS = 4  # role tags, delimiters, etc.
 TRUNCATE_FLOOR_CHARS = 200      # never shrink a message's content below this
 TRUNCATE_MARKER = "\n[... truncated to fit context ...]"
 
+SUMMARY_MAX_CHARS = 800         # cap the digest so it can never dominate the budget
+SUMMARY_MAX_FILES = 15
+# A code-ish path token: has a dir separator or a source-y suffix.
+_PATH_RE = re.compile(r"[\w./-]+\.[A-Za-z0-9]+")
+# Strong test/error signals worth carrying forward from dropped history.
+_SIGNAL_RE = re.compile(
+    r"Traceback|No module named|ModuleNotFoundError|SyntaxError|ImportError|"
+    r"\bError\b|\bException\b|\d+\s+(?:failed|passed|error)|AssertionError"
+)
+
 
 @dataclass
 class TrimResult:
+    """The outcome of a trim: the messages, whether trimming happened, and token totals."""
+
     messages: List[Dict]
     trimmed: bool
     dropped: int
@@ -35,6 +48,8 @@ class TrimResult:
 
 
 class ContextManager:
+    """Trims a message list to fit the model's token budget, pinning key anchors."""
+
     def __init__(
         self,
         max_tokens: int = 8192,
@@ -42,6 +57,7 @@ class ContextManager:
         keep_recent: int = 6,
         chars_per_token: float = DEFAULT_CHARS_PER_TOKEN,
     ) -> None:
+        """Configure the window size, response reserve, and how many recent turns to keep."""
         self.max_tokens = max_tokens
         self.response_reserve = response_reserve
         self.keep_recent = keep_recent
@@ -54,17 +70,21 @@ class ContextManager:
 
     # -- estimation ----------------------------------------------------------
     def estimate(self, text: str) -> int:
+        """Estimate the token count of ``text`` via the chars-per-token heuristic."""
         if not text:
             return PER_MESSAGE_OVERHEAD_TOKENS
         return int(len(text) / self.chars_per_token) + PER_MESSAGE_OVERHEAD_TOKENS
 
     def _msg_tokens(self, message: Dict) -> int:
+        """Estimate the token cost of a single chat message."""
         return self.estimate(str(message.get("content", "")))
 
     def total_tokens(self, messages: List[Dict]) -> int:
+        """Estimate the combined token cost of a whole message list."""
         return sum(self._msg_tokens(m) for m in messages)
 
     def _is_pinned(self, idx: int, msg: Dict, first_non_sys_idx: int) -> bool:
+        """Return True if a message must never be trimmed (system anchors, task primer)."""
         if idx <= first_non_sys_idx:
             return True
         content = str(msg.get("content", ""))
@@ -101,7 +121,9 @@ class ContextManager:
 
         dropped_indices = set()
         current_tokens = total
-        marker_tokens = 20
+        # Leave room for the digest that replaces the dropped block (bounded by
+        # SUMMARY_MAX_CHARS), so we don't drop too little and immediately hard-truncate.
+        marker_tokens = self.estimate("x" * SUMMARY_MAX_CHARS)
 
         # Drop oldest candidates first
         for idx in candidates:
@@ -110,7 +132,10 @@ class ContextManager:
             current_tokens -= self._msg_tokens(messages[idx])
             dropped_indices.add(idx)
 
-        # Rebuild messages list
+        # Rebuild messages list. Instead of a bare "N omitted" marker (pure FIFO, which
+        # discards which files were touched and the last error seen), replace the dropped
+        # block with a compact extractive digest of it.
+        dropped_msgs = [messages[i] for i in range(n) if i in dropped_indices]
         rebuilt = []
         has_dropped = False
         for i in range(n):
@@ -118,7 +143,7 @@ class ContextManager:
                 if not has_dropped:
                     rebuilt.append({
                         "role": "user",
-                        "content": f"[... {len(dropped_indices)} earlier step(s) omitted to fit the context window ...]",
+                        "content": self._summarize_dropped(dropped_msgs),
                     })
                     has_dropped = True
                 continue
@@ -129,6 +154,52 @@ class ContextManager:
             rebuilt = self._hard_truncate(rebuilt)
 
         return TrimResult(rebuilt, True, len(dropped_indices), self.total_tokens(rebuilt))
+
+    def _summarize_dropped(self, dropped: List[Dict]) -> str:
+        """Build a compact, deterministic digest of the messages being dropped.
+
+        Pure FIFO trimming replaces old turns with a bare "N omitted" marker, discarding
+        the two things a mid-task agent most needs to retain: which files it has already
+        touched, and the last test/error signal it saw. (Its goals, plan and lessons are
+        pinned and survive trimming anyway.) This extracts exactly those from the dropped
+        text with no LLM call — so it is free, deterministic, and cannot itself fail or
+        rate-limit on the very turn the window is already under pressure. An LLM-written
+        summary would be richer but adds cost and a new failure mode on the hot path;
+        the state that actually drives recovery is captured well enough by extraction.
+        Capped at SUMMARY_MAX_CHARS so the digest can never dominate the budget.
+        """
+        files: List[str] = []
+        seen: Set[str] = set()
+        last_signal = ""
+        for m in dropped:
+            content = str(m.get("content", ""))
+            for tok in _PATH_RE.findall(content):
+                if tok in seen or ".." in tok:
+                    continue
+                if "/" in tok or tok.endswith(
+                    (".py", ".md", ".txt", ".json", ".toml", ".cfg", ".ini", ".yaml", ".yml")
+                ):
+                    seen.add(tok)
+                    files.append(tok)
+            for line in content.splitlines():
+                line = line.strip()
+                if line and len(line) < 200 and _SIGNAL_RE.search(line):
+                    last_signal = line  # keep the most recent signal across dropped turns
+
+        parts = [
+            f"[... {len(dropped)} earlier step(s) summarized to fit the context window ...]"
+        ]
+        if files:
+            shown = ", ".join(files[:SUMMARY_MAX_FILES])
+            extra = len(files) - SUMMARY_MAX_FILES
+            more = f" (+{extra} more)" if extra > 0 else ""
+            parts.append(f"Files touched in the omitted steps: {shown}{more}.")
+        if last_signal:
+            parts.append(f"Most recent earlier test/error signal: {last_signal[:180]}")
+        summary = "\n".join(parts)
+        if len(summary) > SUMMARY_MAX_CHARS:
+            summary = summary[:SUMMARY_MAX_CHARS] + " ..."
+        return summary
 
     def _hard_truncate(self, messages: List[Dict]) -> List[Dict]:
         """Shrink the largest contents until they fit, sparing the system prompt.
@@ -148,6 +219,7 @@ class ContextManager:
         exhausted: set = set()
 
         def pool_of(idxs):
+            """Return the indices still eligible to be shrunk this pass."""
             return [i for i in idxs if i not in exhausted]
 
         warned = False

@@ -15,6 +15,7 @@ or comprehension. Same posture as the AST command guard.
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -29,7 +30,46 @@ except ImportError:  # pragma: no cover - depends on install
 
 
 class SolverError(Exception):
-    """A constraint could not be understood or the problem was malformed."""
+    """Exception raised for errors in the Z3 solver tool."""
+    pass
+
+def _reject_floordiv(a, b):
+    raise SolverError("Unsupported operator // (FloorDiv) because Z3 division handles types differently. Please rewrite without //.")
+
+
+@dataclass
+class Solution:
+    """The result of a constraint solve: satisfiability plus any assignments."""
+
+    status: str                      # "sat" | "unsat" | "unknown"
+    assignments: Dict[str, Any]
+    message: str = ""
+
+
+@contextmanager
+def _catch_z3_errors(context_msg: str):
+    """Catch Z3 sort mismatches and Python type errors, re-raising as clean SolverErrors.
+    
+    Dynamically resolves Z3Exception to prevent crashes if z3 failed to import.
+    """
+    z3_exceptions = (z3.Z3Exception,) if Z3_AVAILABLE and z3 is not None else ()
+    
+    try:
+        yield
+    except SolverError:
+        raise
+    except z3_exceptions as exc:
+        err_msg = str(exc).strip()
+        raise SolverError(
+            f"Z3 sort mismatch in {context_msg}: {err_msg}. "
+            "Ensure variables and literals have compatible types (e.g., do not mix Int/Real with Bool)."
+        ) from exc
+    except (TypeError, ValueError) as exc:
+        err_msg = str(exc).strip()
+        raise SolverError(
+            f"Incompatible types or values in {context_msg}: {err_msg}. "
+            "Check operator syntax and variable declarations."
+        ) from exc
 
 
 _BIN_OPS = {
@@ -37,6 +77,7 @@ _BIN_OPS = {
     ast.Sub: lambda a, b: a - b,
     ast.Mult: lambda a, b: a * b,
     ast.Div: lambda a, b: a / b,
+    ast.FloorDiv: _reject_floordiv,
     ast.Mod: lambda a, b: a % b,
     ast.Pow: lambda a, b: a ** b,
 }
@@ -51,11 +92,32 @@ _CMP_OPS = {
 }
 
 
-@dataclass
-class Solution:
-    status: str                      # "sat" | "unsat" | "unknown"
-    assignments: Dict[str, Any]
-    message: str = ""
+def _compile_call(node: ast.Call, env: Dict[str, Any]) -> Any:
+    """Safely compile a strict whitelist of mathematical function calls."""
+    if not isinstance(node.func, ast.Name):
+        raise SolverError("Only direct function calls (e.g., min, max, abs) are supported.")
+    
+    func_name = node.func.id
+    args = [_compile(arg, env) for arg in node.args]
+    
+    if func_name == "abs":
+        if len(args) != 1:
+            raise SolverError("abs() requires exactly 1 argument")
+        val = args[0]
+        return z3.If(val >= 0, val, -val)
+        
+    elif func_name in ("min", "max"):
+        if len(args) < 2:
+            raise SolverError(f"{func_name}() requires at least 2 arguments")
+        
+        result = args[0]
+        is_min = (func_name == "min")
+        for next_arg in args[1:]:
+            cond = (result <= next_arg) if is_min else (result >= next_arg)
+            result = z3.If(cond, result, next_arg)
+        return result
+        
+    raise SolverError(f"Unsupported function call: {func_name!r}. Allowed: abs, min, max.")
 
 
 def _declare(variables: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -77,15 +139,16 @@ def _declare(variables: List[Dict[str, Any]]) -> Dict[str, Any]:
             raise SolverError(f"unknown type {kind!r} for {name!r}; use int, real or bool")
         env[name] = var
 
-        if "domain" in spec and spec["domain"] is not None:
-            allowed = spec["domain"]
-            if not isinstance(allowed, list) or not allowed:
-                raise SolverError(f"domain for {name!r} must be a non-empty list")
-            domain_constraints.append(z3.Or([var == v for v in allowed]))
-        if spec.get("min") is not None:
-            domain_constraints.append(var >= spec["min"])
-        if spec.get("max") is not None:
-            domain_constraints.append(var <= spec["max"])
+        with _catch_z3_errors(f"domain declaration for variable {name!r}"):
+            if "domain" in spec and spec["domain"] is not None:
+                allowed = spec["domain"]
+                if not isinstance(allowed, list) or not allowed:
+                    raise SolverError(f"domain for {name!r} must be a non-empty list")
+                domain_constraints.append(z3.Or([var == v for v in allowed]))
+            if spec.get("min") is not None:
+                domain_constraints.append(var >= spec["min"])
+            if spec.get("max") is not None:
+                domain_constraints.append(var <= spec["max"])
     return {"env": env, "domain_constraints": domain_constraints}
 
 
@@ -104,6 +167,10 @@ def _compile(node: ast.AST, env: Dict[str, Any]) -> Any:
             return env[node.id]
         raise SolverError(f"undeclared variable {node.id!r} -- declare it in `variables`")
 
+    # Support sequence literals for membership testing (e.g., [1, 2, 3])
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return [_compile(item, env) for item in node.elts]
+
     if isinstance(node, ast.UnaryOp):
         operand = _compile(node.operand, env)
         if isinstance(node.op, ast.USub):
@@ -118,33 +185,59 @@ def _compile(node: ast.AST, env: Dict[str, Any]) -> Any:
         op = _BIN_OPS.get(type(node.op))
         if op is None:
             raise SolverError(f"unsupported operator {type(node.op).__name__}")
-        return op(_compile(node.left, env), _compile(node.right, env))
+        left = _compile(node.left, env)
+        right = _compile(node.right, env)
+        with _catch_z3_errors(f"binary operation '{type(node.op).__name__}'"):
+            return op(left, right)
+
+    # Support ternary conditional expressions (a if cond else b)
+    if isinstance(node, ast.IfExp):
+        test = _compile(node.test, env)
+        body = _compile(node.body, env)
+        orelse = _compile(node.orelse, env)
+        with _catch_z3_errors("conditional expression (if/else)"):
+            return z3.If(test, body, orelse)
+
+    # Support whitelisted math functions (abs, min, max)
+    if isinstance(node, ast.Call):
+        return _compile_call(node, env)
 
     if isinstance(node, ast.Compare):
-        # Handles chained comparisons: 1 <= x <= 9 becomes And(1 <= x, x <= 9)
         parts = []
         left = _compile(node.left, env)
         for op_node, comparator in zip(node.ops, node.comparators):
-            op = _CMP_OPS.get(type(op_node))
-            if op is None:
-                raise SolverError(f"unsupported comparison {type(op_node).__name__}")
             right = _compile(comparator, env)
-            parts.append(op(left, right))
+            with _catch_z3_errors(f"comparison '{type(op_node).__name__}'"):
+                if isinstance(op_node, ast.In):
+                    if not isinstance(right, list):
+                        raise SolverError("Right-hand side of 'in' must be a list, tuple, or set literal.")
+                    parts.append(z3.Or([left == item for item in right]) if right else z3.BoolVal(False))
+                elif isinstance(op_node, ast.NotIn):
+                    if not isinstance(right, list):
+                        raise SolverError("Right-hand side of 'not in' must be a list, tuple, or set literal.")
+                    parts.append(z3.And([left != item for item in right]) if right else z3.BoolVal(True))
+                else:
+                    op = _CMP_OPS.get(type(op_node))
+                    if op is None:
+                        raise SolverError(f"unsupported comparison {type(op_node).__name__}")
+                    parts.append(op(left, right))
             left = right
-        return parts[0] if len(parts) == 1 else z3.And(*parts)
+        with _catch_z3_errors("chained comparison conjunction"):
+            return parts[0] if len(parts) == 1 else z3.And(*parts)
 
     if isinstance(node, ast.BoolOp):
         values = [_compile(v, env) for v in node.values]
-        if isinstance(node.op, ast.And):
-            return z3.And(*values)
-        if isinstance(node.op, ast.Or):
-            return z3.Or(*values)
+        with _catch_z3_errors(f"boolean operation '{type(node.op).__name__}'"):
+            if isinstance(node.op, ast.And):
+                return z3.And(*values)
+            if isinstance(node.op, ast.Or):
+                return z3.Or(*values)
         raise SolverError("unsupported boolean operator")
 
     raise SolverError(
         f"unsupported expression element {type(node).__name__}. "
-        "Constraints may only use variables, numbers, + - * / % **, "
-        "comparisons, and and/or/not."
+        "Constraints may use variables, numbers, sequence literals, math operators, "
+        "comparisons, membership (in/not in), conditionals (if/else), and abs/min/max."
     )
 
 
@@ -174,22 +267,30 @@ def solve(
             tree = ast.parse(text.strip(), mode="eval")
         except SyntaxError as exc:
             raise SolverError(f"could not parse constraint {text!r}: {exc.msg}") from exc
-        compiled.append(_compile(tree, env))
+        
+        with _catch_z3_errors(f"constraint {text!r}"):
+            compiled.append(_compile(tree, env))
 
     if all_different:
         missing = [n for n in all_different if n not in env]
         if missing:
             raise SolverError(f"all_different names undeclared variables: {missing}")
-        compiled.append(z3.Distinct(*[env[n] for n in all_different]))
+        with _catch_z3_errors("all_different constraint"):
+            compiled.append(z3.Distinct(*[env[n] for n in all_different]))
 
     objective = minimize or maximize
     if objective:
         solver = z3.Optimize()
         for c in compiled:
             solver.add(c)
-        tree = ast.parse(objective.strip(), mode="eval")
-        expr = _compile(tree, env)
-        solver.minimize(expr) if minimize else solver.maximize(expr)
+        try:
+            tree = ast.parse(objective.strip(), mode="eval")
+        except SyntaxError as exc:
+            raise SolverError(f"could not parse objective {objective!r}: {exc.msg}") from exc
+            
+        with _catch_z3_errors(f"objective {objective!r}"):
+            expr = _compile(tree, env)
+            solver.minimize(expr) if minimize else solver.maximize(expr)
     else:
         solver = z3.Solver()
         for c in compiled:
@@ -209,7 +310,5 @@ def solve(
                 out[name] = str(value)
         return Solution("sat", out, "found a satisfying assignment")
     if result == z3.unsat:
-        # An unsat result is information, not a failure: the constraints
-        # genuinely conflict, and saying so beats returning a plausible guess.
         return Solution("unsat", {}, "no assignment satisfies these constraints -- they conflict")
     return Solution("unknown", {}, "the solver could not decide within its limits")

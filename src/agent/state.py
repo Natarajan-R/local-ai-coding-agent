@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional
 
 @dataclass
 class AgentFrame:
+    """The working state for one task run, threaded through every FSM step."""
+
     task_description: str
     plan: Optional[str] = None
     current_file: Optional[Path] = None
@@ -20,4 +22,5 @@ class AgentFrame:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def add_reflection(self, lesson: str) -> None:
+        """Record a lesson learned from a failed attempt for later reflexion."""
         self.reflections.append(lesson)

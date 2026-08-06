@@ -1,14 +1,26 @@
 // AI Coding Agent — VS Code extension.
 //
-// The extension host holds a WebSocket to a running `ai-agent serve` instance,
-// relays its structured events to a webview (a live run viewer + task composer),
-// and answers approval / escalation prompts with NATIVE VS Code dialogs.
+// The extension host holds a WebSocket to a running `ai-agent serve` instance and
+// relays its structured events to a webview chat panel: each message you send is
+// one task run, and the agent's plan / tool calls / evaluation render as its reply.
+//
+// Approval and hint prompts are answered either inline in the thread or with NATIVE
+// VS Code dialogs — see `promptTarget()`. Only one of the two is offered at a time,
+// so a single decision never gets asked twice.
 import * as vscode from "vscode";
+import * as fs from "fs";
+import * as path from "path";
 import WebSocket from "ws";
 
 let panel: vscode.WebviewPanel | undefined;
 let socket: WebSocket | undefined;
 let output: vscode.OutputChannel;
+// Absolute path of the workspace the *agent* was started with (`ai-agent serve
+// --workspace …`), learned from the `connected` event. This is the only tree the
+// agent can read or write, and every path in a tool call is relative to it — so it,
+// not the VS Code folder, is what the file panel must show.
+let agentWorkspace: string | undefined;
+let refreshTimer: NodeJS.Timeout | undefined;
 // The server sends `connected` (with the model/workspace config) once, the moment the
 // socket opens — long before a webview exists to hear it. Keep it so a panel opened
 // later can still be told what it is connected *to*, not merely that it is connected.
@@ -17,19 +29,21 @@ let lastConnected: unknown;
 export function activate(context: vscode.ExtensionContext): void {
   output = vscode.window.createOutputChannel("AI Coding Agent");
   context.subscriptions.push(
-    vscode.commands.registerCommand("aiAgent.openDashboard", () => openDashboard(context)),
+    vscode.commands.registerCommand("aiAgent.openChat", () => openChat(context)),
+    // Kept so existing keybindings/muscle memory still work; same panel.
+    vscode.commands.registerCommand("aiAgent.openDashboard", () => openChat(context)),
     vscode.commands.registerCommand("aiAgent.runTask", () => runTaskCommand(context)),
     output
   );
 
   // Watch workspace changes and refresh file explorer in the webview
   const watcher = vscode.workspace.createFileSystemWatcher("**/*");
-  watcher.onDidCreate(() => sendWorkspaceFiles());
-  watcher.onDidChange(() => sendWorkspaceFiles());
-  watcher.onDidDelete(() => sendWorkspaceFiles());
+  watcher.onDidCreate(() => scheduleWorkspaceRefresh());
+  watcher.onDidChange(() => scheduleWorkspaceRefresh());
+  watcher.onDidDelete(() => scheduleWorkspaceRefresh());
   context.subscriptions.push(
     watcher,
-    vscode.workspace.onDidChangeWorkspaceFolders(() => sendWorkspaceFiles())
+    vscode.workspace.onDidChangeWorkspaceFolders(() => scheduleWorkspaceRefresh())
   );
 }
 
@@ -101,14 +115,47 @@ function ensureSocket(): WebSocket {
   return socket;
 }
 
+// Where an approval / hint decision should be asked.
+//
+// Asking in both places at once would prompt the user twice for one decision, so
+// exactly one target is chosen. "auto" prefers the thread when the chat panel is
+// actually on screen, and falls back to a native dialog when it is hidden or
+// closed — otherwise a run started from the command palette could block on a
+// prompt nobody can see.
+function promptTarget(): "inline" | "native" {
+  const style = config<string>("promptStyle", "auto");
+  if (style === "inline") { return "inline"; }
+  if (style === "native") { return "native"; }
+  return panel && panel.visible ? "inline" : "native";
+}
+
 async function handleServerEvent(msg: any): Promise<void> {
   if (msg.event === "connected") {
     lastConnected = msg;
+    const ws = msg.config && msg.config.workspace;
+    if (typeof ws === "string" && ws) {
+      agentWorkspace = path.resolve(ws);
+      sendWorkspaceFiles();
+    }
   }
-  // Always mirror the event into the webview for the live view.
-  toWebview(msg);
+  // The agent's tree lives outside the editor's folder in the common case, where
+  // no FileSystemWatcher fires. Re-scan when a run has actually changed something.
+  if (msg.event === "run_finished" || msg.event === "run_stopped") {
+    scheduleWorkspaceRefresh();
+  }
 
-  // Native prompts for the interactive decisions.
+  const interactive = msg.event === "approval_required" || msg.event === "escalation_required";
+  const target = interactive ? promptTarget() : "native";
+
+  // Mirror every event into the chat thread. Interactive events carry the chosen
+  // target so the webview knows whether to render actionable controls or just a
+  // read-only note pointing at the native dialog.
+  toWebview(interactive ? { ...msg, promptTarget: target } : msg);
+
+  if (target === "inline") {
+    return; // the webview owns this decision; it replies with approval/hint.
+  }
+
   if (msg.event === "approval_required") {
     const choice = await vscode.window.showWarningMessage(
       `AI Agent wants to run a command:\n\n${msg.detail}`,
@@ -128,34 +175,78 @@ async function handleServerEvent(msg: any): Promise<void> {
   }
 }
 
-async function sendWorkspaceFiles(): Promise<void> {
-  const folders = vscode.workspace.workspaceFolders;
-  if (!folders || folders.length === 0) {
-    toWebview({ event: "workspace_files", folders: [], activeFolder: "", files: [] });
+// Directories that are never worth showing: build output, caches, and vendored
+// trees. `*.egg-info` matters more than it looks — it holds six near-identically
+// named files that render as apparent duplicates in a narrow column.
+const IGNORED_DIRS = new Set([
+  "node_modules", ".git", ".venv", "venv", "env", "__pycache__", ".pytest_cache",
+  ".ruff_cache", ".mypy_cache", "out", "dist", "build", ".gemini", "logs",
+  ".idea", ".vscode", "htmlcov", ".ai-agent",
+]);
+const MAX_LISTED_FILES = 500;
+
+// Walk the agent's workspace directly rather than using vscode.workspace.findFiles:
+// the agent's root is frequently *not* the folder open in VS Code (here it was
+// `ai-coding-agent/workspace`, a subdirectory), and findFiles cannot see outside
+// the editor's folders at all.
+function walkWorkspace(root: string): { files: string[]; truncated: boolean } {
+  const files: string[] = [];
+  let truncated = false;
+  const stack: string[] = [root];
+  while (stack.length > 0) {
+    if (files.length >= MAX_LISTED_FILES) { truncated = true; break; }
+    const dir = stack.pop() as string;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;  // unreadable directory: skip rather than fail the whole listing
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (IGNORED_DIRS.has(entry.name) || entry.name.endsWith(".egg-info")) { continue; }
+        stack.push(full);
+      } else if (entry.isFile()) {
+        if (files.length >= MAX_LISTED_FILES) { truncated = true; break; }
+        files.push(path.relative(root, full).split(path.sep).join("/"));
+      }
+    }
+  }
+  files.sort();
+  return { files, truncated };
+}
+
+function sendWorkspaceFiles(): void {
+  if (!agentWorkspace) {
+    // Not connected yet, so the agent's root is unknown. Saying so beats listing
+    // the editor's folder, which the agent may have no access to at all.
+    toWebview({ event: "workspace_files", root: "", files: [], truncated: false, connected: false });
     return;
   }
-
-  const activeFolder = folders[0];
-  const relativePattern = new vscode.RelativePattern(activeFolder, "**/*");
-  const uris = await vscode.workspace.findFiles(
-    relativePattern,
-    "**/{node_modules,.git,.venv,__pycache__,out,dist,build,.gemini,logs}/**"
-  );
-  
-  const files = uris.map(u => vscode.workspace.asRelativePath(u, false));
+  const { files, truncated } = walkWorkspace(agentWorkspace);
   toWebview({
     event: "workspace_files",
-    folders: folders.map(f => ({ name: f.name, path: f.uri.fsPath })),
-    activeFolder: activeFolder.name,
-    files: files
+    root: agentWorkspace,
+    rootName: path.basename(agentWorkspace),
+    files,
+    truncated,
+    connected: true,
   });
 }
 
+// The watcher fires for every write in the editor's folder — during a pytest run
+// that is hundreds of events, each previously triggering a full re-scan.
+function scheduleWorkspaceRefresh(): void {
+  if (refreshTimer) { clearTimeout(refreshTimer); }
+  refreshTimer = setTimeout(() => { refreshTimer = undefined; sendWorkspaceFiles(); }, 400);
+}
+
 async function openFileInEditor(relativePath: string): Promise<void> {
-  const folders = vscode.workspace.workspaceFolders;
-  if (!folders || folders.length === 0) { return; }
-  const activeFolder = folders[0];
-  const fileUri = vscode.Uri.joinPath(activeFolder.uri, relativePath);
+  // Paths in the panel are relative to the agent's workspace, so resolve them
+  // against that root — not the editor's folder, which is often a different tree.
+  if (!agentWorkspace) { return; }
+  const fileUri = vscode.Uri.file(path.join(agentWorkspace, relativePath));
   try {
     const doc = await vscode.workspace.openTextDocument(fileUri);
     await vscode.window.showTextDocument(doc);
@@ -177,7 +268,7 @@ async function selectWorkspaceFolder(): Promise<void> {
   }
 }
 
-function openDashboard(context: vscode.ExtensionContext): void {
+function openChat(context: vscode.ExtensionContext): void {
   if (panel) {
     panel.reveal(vscode.ViewColumn.Beside);
   } else {
@@ -207,6 +298,10 @@ function openDashboard(context: vscode.ExtensionContext): void {
         sendToServer({ type: "resume" });
       } else if (m.type === "stop") {
         sendToServer({ type: "stop" });
+      } else if (m.type === "approval") {
+        sendToServer({ type: "approval", id: m.id, approved: !!m.approved });
+      } else if (m.type === "hint") {
+        sendToServer({ type: "hint", id: m.id, hint: m.hint ?? "" });
       } else if (m.type === "openFile") {
         openFileInEditor(m.path);
       } else if (m.type === "selectFolder") {
@@ -218,7 +313,7 @@ function openDashboard(context: vscode.ExtensionContext): void {
 }
 
 async function runTaskCommand(context: vscode.ExtensionContext): Promise<void> {
-  openDashboard(context);
+  openChat(context);
   const task = await vscode.window.showInputBox({
     title: "AI Coding Agent",
     prompt: "Describe the coding task",
@@ -314,14 +409,43 @@ function getHtml(webview: vscode.Webview): string {
   }
   .file-item {
     cursor: pointer;
-    padding: 4px 6px;
+    padding: 3px 6px;
     border-radius: 3px;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    overflow: hidden;
+  }
+  /* The name carries its own truncation. Clipping on the flex row instead cut the
+     glyph box and made trailing underscores invisible — "__init__.py" read as
+     " init .py". line-height keeps descenders inside the box. */
+  .file-name {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    display: flex;
-    align-items: center;
-    gap: 6px;
+    line-height: 1.5;
+    flex-shrink: 0;
+    max-width: 60%;
+  }
+  /* Directory shown after the name, truncated from the LEFT so the meaningful tail
+     stays visible: six files under one long directory used to truncate to the same
+     text and read as duplicates. */
+  .file-dir {
+    font-size: 10px;
+    opacity: .55;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    direction: rtl;
+    text-align: left;
+    line-height: 1.5;
+    flex: 1;
+    min-width: 0;
+  }
+  #file-count {
+    font-size: 10px;
+    opacity: .6;
+    margin-bottom: 6px;
   }
   .file-item:hover {
     background: var(--vscode-list-hoverBackground);
@@ -346,7 +470,14 @@ function getHtml(webview: vscode.Webview): string {
   #composer {
     display: flex;
     gap: 6px;
-    margin-bottom: 8px;
+    margin-top: 8px;
+    flex-shrink: 0;
+    align-items: flex-end;
+  }
+  #hint-row {
+    font-size: 11px;
+    opacity: .6;
+    margin-top: 4px;
     flex-shrink: 0;
   }
   textarea {
@@ -393,18 +524,55 @@ function getHtml(webview: vscode.Webview): string {
     font-size: 12px;
     opacity: .7;
   }
-  #feed {
+  #transcript {
     flex: 1;
     overflow-y: auto;
     border: 1px solid var(--vscode-panel-border);
     border-radius: 4px;
-    padding: 8px;
+    padding: 10px;
     background: var(--vscode-editorWidget-background);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
   }
+  #empty-state {
+    margin: auto;
+    text-align: center;
+    opacity: .55;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  /* ---- chat turns ---------------------------------------------------- */
+  .msg { display: flex; flex-direction: column; }
+  .msg-role {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    opacity: .6;
+    margin-bottom: 3px;
+  }
+  .msg.user .bubble {
+    align-self: flex-start;
+    background: var(--vscode-textBlockQuote-background);
+    border-left: 3px solid var(--vscode-charts-blue);
+    padding: 7px 10px;
+    border-radius: 4px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-width: 100%;
+  }
+  .msg.agent {
+    border-left: 3px solid var(--vscode-panel-border);
+    padding-left: 10px;
+  }
+  .msg.agent.done { border-left-color: var(--vscode-charts-green); }
+  .msg.agent.failed { border-left-color: var(--vscode-charts-red); }
+  .turn-status { font-size: 11px; opacity: .75; margin-bottom: 6px; }
+  .activity { display: flex; flex-direction: column; gap: 5px; }
+  /* ---- individual steps ---------------------------------------------- */
   .card {
     border-left: 3px solid var(--vscode-panel-border);
-    padding: 6px 8px;
-    margin: 6px 0;
+    padding: 5px 8px;
     background: var(--vscode-editor-background);
     border-radius: 4px;
     white-space: pre-wrap;
@@ -415,6 +583,53 @@ function getHtml(webview: vscode.Webview): string {
   .fail { border-left-color: var(--vscode-charts-red); }
   .tag { font-size: 11px; opacity: .7; }
   .stream { font-family: var(--vscode-editor-font-family); font-size: 12px; opacity: .85; }
+  details.step { background: var(--vscode-editor-background); border-radius: 4px; }
+  details.step > summary {
+    cursor: pointer;
+    padding: 5px 8px;
+    font-size: 11px;
+    opacity: .8;
+    list-style: none;
+  }
+  details.step > summary::-webkit-details-marker { display: none; }
+  details.step > summary::before { content: '▸ '; opacity: .6; }
+  details.step[open] > summary::before { content: '▾ '; }
+  details.step > pre {
+    margin: 0;
+    padding: 0 8px 7px 8px;
+    font-family: var(--vscode-editor-font-family);
+    font-size: 11px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    opacity: .9;
+  }
+  /* ---- inline prompts ------------------------------------------------- */
+  .prompt {
+    border: 1px solid var(--vscode-inputValidation-warningBorder, var(--vscode-panel-border));
+    background: var(--vscode-inputValidation-warningBackground, var(--vscode-editor-background));
+    border-radius: 4px;
+    padding: 8px;
+  }
+  .prompt-title { font-size: 11px; font-weight: 600; margin-bottom: 5px; }
+  .prompt pre {
+    margin: 0 0 8px 0;
+    font-family: var(--vscode-editor-font-family);
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .prompt-actions { display: flex; gap: 6px; align-items: center; }
+  .prompt.answered { opacity: .65; }
+  .answer-note { font-size: 11px; font-style: italic; opacity: .8; }
+  .prompt input[type=text] {
+    flex: 1;
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    border: 1px solid var(--vscode-input-border);
+    border-radius: 4px;
+    padding: 4px 6px;
+    font: inherit;
+  }
 </style>
 </head>
 <body>
@@ -424,13 +639,16 @@ function getHtml(webview: vscode.Webview): string {
   </div>
   <div id="container">
     <div id="explorer-panel">
-      <div id="explorer-title">Project Files</div>
-      <div id="file-list">📁 Loading...</div>
+      <div id="explorer-title">Agent Workspace</div>
+      <div id="file-count"></div>
+      <div id="file-list">📁 Loading…</div>
     </div>
     <div id="main-panel">
-      <div id="composer">
-        <textarea id="task" rows="2" placeholder="Describe a coding task…"></textarea>
-        <button id="run">Run</button>
+      <div id="transcript">
+        <div id="empty-state">
+          Ask the agent to change your code.<br />
+          Each message runs one task — you'll see its plan, tool calls and test results here.
+        </div>
       </div>
       <div id="controls">
         <button id="clear" class="secondary">Clear</button>
@@ -438,33 +656,219 @@ function getHtml(webview: vscode.Webview): string {
         <button id="resume" class="secondary" style="display:none;">Resume</button>
         <button id="stop" class="danger" style="display:none;">Stop</button>
       </div>
-      <div id="feed"></div>
+      <div id="composer">
+        <textarea id="task" rows="2" placeholder="Describe a coding task…"></textarea>
+        <button id="run">Send</button>
+      </div>
+      <div id="hint-row">Enter to send · Shift+Enter for a new line</div>
     </div>
   </div>
 <script nonce="${n}">
   const vscode = acquireVsCodeApi();
-  const feed = document.getElementById('feed');
+  const transcript = document.getElementById('transcript');
   const statusEl = document.getElementById('status');
   const runBtn = document.getElementById('run');
+  const taskEl = document.getElementById('task');
   const pauseBtn = document.getElementById('pause');
   const resumeBtn = document.getElementById('resume');
   const stopBtn = document.getElementById('stop');
 
-  let streamEl = null;
+  let streamEl = null;      // live token sink inside the current turn
+  let turnEl = null;        // the agent turn currently being written
+  let activityEl = null;    // step container inside that turn
+  let statusLineEl = null;  // one-line status at the top of the turn
+  let awaitingRunStart = false;  // this webview sent the task, so don't echo it twice
+  let running = false;
   let allFiles = [];
+  let explorerRoot = '';
+  let explorerTruncated = false;
+  let explorerConnected = false;
   const modifiedFiles = {};
 
+  // Keep the view pinned to the newest content only when the user is already at the
+  // bottom; yanking the scroll while they are reading earlier turns is hostile.
+  function nearBottom() {
+    return transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80;
+  }
+  function scrollIfPinned(wasNear) {
+    if (wasNear) { transcript.scrollTop = transcript.scrollHeight; }
+  }
+
+  function dropEmptyState() {
+    const es = document.getElementById('empty-state');
+    if (es) { es.remove(); }
+  }
+
+  function addUserMessage(text) {
+    dropEmptyState();
+    const wasNear = nearBottom();
+    const wrap = document.createElement('div');
+    wrap.className = 'msg user';
+    const role = document.createElement('div');
+    role.className = 'msg-role'; role.textContent = 'You';
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble'; bubble.textContent = text;
+    wrap.appendChild(role); wrap.appendChild(bubble);
+    transcript.appendChild(wrap);
+    scrollIfPinned(wasNear);
+  }
+
+  // Start a fresh agent turn. Unlike the old flat feed, previous turns are kept:
+  // the transcript is the conversation history.
+  function beginTurn() {
+    dropEmptyState();
+    const wasNear = nearBottom();
+    turnEl = document.createElement('div');
+    turnEl.className = 'msg agent';
+    const role = document.createElement('div');
+    role.className = 'msg-role'; role.textContent = 'Agent';
+    statusLineEl = document.createElement('div');
+    statusLineEl.className = 'turn-status'; statusLineEl.textContent = 'Working…';
+    activityEl = document.createElement('div');
+    activityEl.className = 'activity';
+    turnEl.appendChild(role); turnEl.appendChild(statusLineEl); turnEl.appendChild(activityEl);
+    transcript.appendChild(turnEl);
+    streamEl = null;
+    scrollIfPinned(wasNear);
+    return turnEl;
+  }
+
+  function ensureTurn() {
+    if (!activityEl) { beginTurn(); }
+    return activityEl;
+  }
+
+  function setTurnStatus(text, cls) {
+    if (statusLineEl) { statusLineEl.textContent = text; }
+    if (turnEl && cls) { turnEl.classList.add(cls); }
+  }
+
+  // Append a step to the current agent turn.
   function card(cls, head, body) {
+    const host = ensureTurn();
+    const wasNear = nearBottom();
     const c = document.createElement('div'); c.className = 'card ' + (cls||'');
     const h = document.createElement('div'); h.className='tag'; h.textContent = head; c.appendChild(h);
     if (body != null) { const b = document.createElement('div'); b.textContent = body; c.appendChild(b); }
-    feed.appendChild(c); c.scrollIntoView(); return c;
+    host.appendChild(c); scrollIfPinned(wasNear); return c;
+  }
+
+  // Collapsed by default: tool payloads are long and usually noise until they matter.
+  function step(head, body, cls) {
+    const host = ensureTurn();
+    const wasNear = nearBottom();
+    const d = document.createElement('details');
+    d.className = 'step card ' + (cls||'');
+    const s = document.createElement('summary'); s.textContent = head; d.appendChild(s);
+    if (body != null && body !== '') {
+      const pre = document.createElement('pre'); pre.textContent = body; d.appendChild(pre);
+    }
+    host.appendChild(d); scrollIfPinned(wasNear); return d;
   }
 
   function ensureStream(label) {
     if (!streamEl) { const c = card('', label || 'model', ''); streamEl = document.createElement('div');
       streamEl.className = 'stream'; c.appendChild(streamEl); }
     return streamEl;
+  }
+
+  // A one-line gist for the collapsed summary: the path if there is one, else the
+  // first short scalar argument. Keeps the thread scannable without expanding.
+  function shortArgs(args) {
+    if (!args || typeof args !== 'object') { return ''; }
+    if (args.path) { return String(args.path); }
+    for (const k in args) {
+      const v = args[k];
+      if (typeof v === 'string' && v.length <= 60) { return v; }
+    }
+    return '';
+  }
+
+  function setRunning(isRunning) {
+    running = isRunning;
+    runBtn.textContent = isRunning ? 'Running…' : 'Send';
+    runBtn.disabled = isRunning;
+    taskEl.placeholder = isRunning
+      ? 'Waiting for the current task to finish…'
+      : 'Describe a coding task…';
+  }
+
+  // ---- inline prompts -------------------------------------------------
+  // Rendered only when the host says this panel owns the decision
+  // (promptTarget === 'inline'); otherwise a read-only note points at the dialog.
+  function addApprovalPrompt(id, detail, actionable) {
+    const host = ensureTurn();
+    const wasNear = nearBottom();
+    const box = document.createElement('div');
+    box.className = 'prompt';
+    const title = document.createElement('div');
+    title.className = 'prompt-title';
+    title.textContent = actionable
+      ? 'Approve this command?'
+      : 'Approval required — answer in the VS Code prompt';
+    box.appendChild(title);
+    const pre = document.createElement('pre'); pre.textContent = detail || ''; box.appendChild(pre);
+    if (actionable) {
+      const actions = document.createElement('div');
+      actions.className = 'prompt-actions';
+      const yes = document.createElement('button'); yes.textContent = 'Approve';
+      const no = document.createElement('button'); no.textContent = 'Deny'; no.className = 'secondary';
+      const answer = (approved) => {
+        vscode.postMessage({ type: 'approval', id: id, approved: approved });
+        actions.remove();
+        box.classList.add('answered');
+        const note = document.createElement('div');
+        note.className = 'answer-note';
+        note.textContent = approved ? 'Approved' : 'Denied';
+        box.appendChild(note);
+      };
+      yes.addEventListener('click', () => answer(true));
+      no.addEventListener('click', () => answer(false));
+      actions.appendChild(yes); actions.appendChild(no);
+      box.appendChild(actions);
+    }
+    host.appendChild(box); scrollIfPinned(wasNear);
+  }
+
+  function addHintPrompt(id, context, actionable) {
+    const host = ensureTurn();
+    const wasNear = nearBottom();
+    const box = document.createElement('div');
+    box.className = 'prompt';
+    const title = document.createElement('div');
+    title.className = 'prompt-title';
+    title.textContent = actionable
+      ? 'The agent is stuck — give it a hint?'
+      : 'Hint requested — answer in the VS Code prompt';
+    box.appendChild(title);
+    const pre = document.createElement('pre'); pre.textContent = context || ''; box.appendChild(pre);
+    if (actionable) {
+      const actions = document.createElement('div');
+      actions.className = 'prompt-actions';
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.placeholder = 'e.g. the bug is an off-by-one in the loop';
+      const send = document.createElement('button'); send.textContent = 'Send hint';
+      const give = document.createElement('button'); give.textContent = 'Give up'; give.className = 'secondary';
+      const answer = (hint) => {
+        vscode.postMessage({ type: 'hint', id: id, hint: hint });
+        actions.remove();
+        box.classList.add('answered');
+        const note = document.createElement('div');
+        note.className = 'answer-note';
+        note.textContent = hint ? 'Hint sent: ' + hint : 'Gave up';
+        box.appendChild(note);
+      };
+      send.addEventListener('click', () => answer(input.value.trim()));
+      give.addEventListener('click', () => answer(''));
+      input.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') { ev.preventDefault(); answer(input.value.trim()); }
+      });
+      actions.appendChild(input); actions.appendChild(send); actions.appendChild(give);
+      box.appendChild(actions);
+      input.focus();
+    }
+    host.appendChild(box); scrollIfPinned(wasNear);
   }
 
   function setControlState(state) {
@@ -485,13 +889,27 @@ function getHtml(webview: vscode.Webview): string {
 
   function updateExplorer() {
     const list = document.getElementById('file-list');
+    const count = document.getElementById('file-count');
     list.innerHTML = '';
-    
+
+    if (!explorerConnected) {
+      count.textContent = '';
+      const empty = document.createElement('div');
+      empty.style.opacity = '0.5';
+      empty.style.fontStyle = 'italic';
+      empty.textContent = 'Not connected — start the ai-agent serve process.';
+      list.appendChild(empty);
+      return;
+    }
+
+    count.textContent = allFiles.length + (explorerTruncated ? '+ files (capped)' : ' file' + (allFiles.length === 1 ? '' : 's'))
+      + (explorerRoot ? ' in ' + explorerRoot : '');
+
     if (allFiles.length === 0) {
       const empty = document.createElement('div');
       empty.style.opacity = '0.5';
       empty.style.fontStyle = 'italic';
-      empty.textContent = 'No files found';
+      empty.textContent = 'Workspace is empty';
       list.appendChild(empty);
       return;
     }
@@ -499,7 +917,8 @@ function getHtml(webview: vscode.Webview): string {
     allFiles.forEach(file => {
       const item = document.createElement('div');
       item.className = 'file-item';
-      
+      item.title = file;   // full path on hover; the row itself shows name + dir
+
       const change = modifiedFiles[file];
       if (change === 'new') {
         item.classList.add('file-new');
@@ -512,9 +931,24 @@ function getHtml(webview: vscode.Webview): string {
       icon.textContent = change === 'new' ? '✚' : change === 'modified' ? '✏' : '📄';
       item.appendChild(icon);
 
+      // Lead with the file name. Showing the full relative path truncated to a
+      // 220px column made six distinct files under one directory render as the
+      // same row six times.
+      const slash = file.lastIndexOf('/');
+      const base = slash === -1 ? file : file.slice(slash + 1);
+      const dir = slash === -1 ? '' : file.slice(0, slash);
+
       const name = document.createElement('span');
-      name.textContent = file;
+      name.className = 'file-name';
+      name.textContent = base;
       item.appendChild(name);
+
+      if (dir) {
+        const dirEl = document.createElement('span');
+        dirEl.className = 'file-dir';
+        dirEl.textContent = dir;
+        item.appendChild(dirEl);
+      }
 
       item.addEventListener('click', () => {
         vscode.postMessage({ type: 'openFile', path: file });
@@ -529,16 +963,26 @@ function getHtml(webview: vscode.Webview): string {
       case 'host_status': statusEl.textContent = e.connected ? 'Connected' : 'Disconnected'; break;
       case 'connected': statusEl.textContent = 'Ready · ' + (e.config ? e.config.model : ''); break;
       case 'run_started':
-        feed.innerHTML='';
-        streamEl=null;
+        // The transcript is the conversation: keep earlier turns, start a new one.
+        // A run launched from the command palette never passed through this webview,
+        // so echo its task as the user's message; one we sent is already shown.
+        if (!awaitingRunStart) { addUserMessage(e.task); }
+        awaitingRunStart = false;
         for (const k in modifiedFiles) delete modifiedFiles[k];
         updateExplorer();
         statusEl.textContent='Running…';
-        card('', 'task', e.task);
+        beginTurn();
+        setRunning(true);
         setControlState('running');
         break;
-      case 'state_changed': streamEl=null; card('', 'state', e.state); break;
+      case 'state_changed': streamEl=null; setTurnStatus(e.state); break;
       case 'token': ensureStream(e.label).textContent += e.text; break;
+      // Emitted instead of 'token' when the run is not streaming. Without this the
+      // model's actual reply never appears — the one thing a chat must not drop.
+      case 'assistant_message':
+        streamEl = null;
+        if (e.content && String(e.content).trim()) { card('', e.label || 'assistant', e.content); }
+        break;
       case 'memory_loaded': card('', 'memory', 'Recalled ' + e.count + ' fact(s) learned in previous runs'); break;
       case 'context_trimmed': streamEl=null; card('', 'context trimmed',
         (e.dropped ? 'Dropped ' + e.dropped + ' old step(s) to fit the window'
@@ -548,7 +992,9 @@ function getHtml(webview: vscode.Webview): string {
         'Repeated ' + e.tool + ' with no progress — stopping this phase and evaluating'); break;
       case 'give_up':
         streamEl=null;
+        setRunning(false);
         setControlState('idle');
+        setTurnStatus('Gave up', 'failed');
         card('fail', 'gave up',
           'Retry budget exhausted after ' + e.retries + (e.retries === 1 ? ' retry' : ' retries')
           + '. Stopping instead of looping.' + (e.summary ? '\\n' + e.summary : ''));
@@ -556,7 +1002,7 @@ function getHtml(webview: vscode.Webview): string {
       case 'plan': streamEl=null; card('', 'plan', e.text); break;
       case 'tool_call':
         streamEl=null;
-        card('tool', 'tool: ' + e.tool, JSON.stringify(e.args));
+        step('' + e.tool + '  ' + shortArgs(e.args), JSON.stringify(e.args, null, 2), 'tool');
         if (e.tool === 'write_file' || e.tool === 'search_replace' || e.tool === 'replace_all' || e.tool === 'add_docstring') {
           const filePath = e.args.path;
           if (filePath) {
@@ -565,11 +1011,19 @@ function getHtml(webview: vscode.Webview): string {
           }
         }
         break;
-      case 'tool_result': card(e.ok ? 'ok' : 'fail', 'result: ' + e.tool, e.content); break;
+      case 'tool_result':
+        step((e.ok ? '✓ ' : '✗ ') + e.tool, e.content, e.ok ? 'ok' : 'fail');
+        break;
       case 'evaluation': card(e.passed ? 'ok' : 'fail', 'evaluation', e.summary); break;
       case 'reflexion': card('', 'reflexion #' + e.retry, e.lesson); break;
-      case 'approval_required': card('', 'approval (answer in the VS Code prompt)', e.detail); break;
-      case 'escalation_required': card('', 'stuck — hint requested (see prompt)', e.context); break;
+      case 'approval_required':
+        streamEl = null;
+        addApprovalPrompt(e.id, e.detail, e.promptTarget === 'inline');
+        break;
+      case 'escalation_required':
+        streamEl = null;
+        addHintPrompt(e.id, e.context, e.promptTarget === 'inline');
+        break;
       case 'run_paused':
         setControlState('paused');
         statusEl.textContent = 'Paused';
@@ -582,46 +1036,69 @@ function getHtml(webview: vscode.Webview): string {
         break;
       case 'run_stopped':
         streamEl = null;
+        setRunning(false);
         setControlState('idle');
         statusEl.textContent = 'Stopped';
+        setTurnStatus('Stopped', 'failed');
         card('fail', 'stopped', 'Run stopped by you' + (e.reason ? ' (' + e.reason + ')' : '') + '.');
         break;
       case 'run_finished':
+        streamEl = null;
         statusEl.textContent='Finished: ' + e.final_state;
+        setRunning(false);
         setControlState('idle');
+        setTurnStatus(e.final_state === 'done' ? 'Done' : 'Finished: ' + e.final_state,
+                      e.final_state === 'done' ? 'done' : 'failed');
         if (e.summary) card(e.final_state==='done'?'ok':'fail', 'summary', e.summary);
         if (e.stats) card('', 'telemetry', e.stats.model_calls + ' model calls · '
           + e.stats.total_tokens + ' tokens · ' + (e.stats.total_seconds||0).toFixed(1)
           + 's · $0.00');
+        // Close the turn so the next message starts a fresh one.
+        turnEl = null; activityEl = null; statusLineEl = null;
         break;
       case 'error':
+        awaitingRunStart = false;
+        setRunning(false);
         setControlState('idle');
         card('fail', 'error', e.message);
         break;
-      case 'workspace_files':
-        allFiles = e.files;
+      case 'workspace_files': {
+        allFiles = e.files || [];
+        explorerRoot = e.rootName || '';
+        explorerTruncated = !!e.truncated;
+        explorerConnected = !!e.connected;
         const wsInfo = document.getElementById('workspace-info');
-        if (e.folders && e.folders.length > 0) {
-          wsInfo.innerHTML = '📁 Workspace: <strong>' + e.activeFolder + '</strong>';
-        } else {
-          wsInfo.innerHTML = '📁 No folder open · <button class="link-btn" id="btn-select-folder">Open Folder</button>';
-          document.getElementById('btn-select-folder')?.addEventListener('click', () => {
-            vscode.postMessage({ type: 'selectFolder' });
-          });
-        }
+        // Show the agent's root, not the editor's folder: they are frequently
+        // different trees, and only this one is what the agent can touch.
+        wsInfo.textContent = explorerConnected
+          ? '📁 Agent workspace: ' + (e.root || '')
+          : '📁 Not connected';
         updateExplorer();
         break;
+      }
     }
   });
 
-  runBtn.addEventListener('click', () => {
-    const task = document.getElementById('task').value.trim();
-    if (task) vscode.postMessage({ type: 'run', task });
+  function submitTask() {
+    if (running) { return; }   // the server refuses a second concurrent run
+    const task = taskEl.value.trim();
+    if (!task) { return; }
+    addUserMessage(task);
+    awaitingRunStart = true;
+    taskEl.value = '';
+    vscode.postMessage({ type: 'run', task: task });
+  }
+
+  runBtn.addEventListener('click', submitTask);
+
+  // Enter sends, Shift+Enter inserts a newline — the usual chat contract.
+  taskEl.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); submitTask(); }
   });
 
   document.getElementById('clear').addEventListener('click', () => {
-    feed.innerHTML = '';
-    streamEl = null;
+    transcript.innerHTML = '';
+    streamEl = null; turnEl = null; activityEl = null; statusLineEl = null;
   });
 
   pauseBtn.addEventListener('click', () => {

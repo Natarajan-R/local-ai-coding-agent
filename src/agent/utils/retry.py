@@ -32,8 +32,11 @@ def async_retry(
     """
 
     def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+        """Wrap ``func`` with the retry loop configured above."""
+
         @wraps(func)
         async def wrapper(*args, **kwargs) -> T:
+            """Call ``func``, retrying on the configured exceptions with backoff."""
             delay = base_delay
             last_exc: BaseException | None = None
             for attempt in range(1, max_attempts + 1):
@@ -52,6 +55,14 @@ def async_retry(
                     sleep_for = min(delay, max_delay)
                     if jitter:
                         sleep_for *= 0.5 + random.random() / 2.0
+                    # Honor a server-provided Retry-After (e.g. HTTP 429): wait at
+                    # least as long as it asked, even beyond max_delay.
+                    retry_after = getattr(exc, "retry_after", None)
+                    if retry_after:
+                        try:
+                            sleep_for = max(sleep_for, float(retry_after))
+                        except (TypeError, ValueError):
+                            pass
                     logger.warning(
                         "%s failed (attempt %d/%d): %s -- retrying in %.2fs",
                         func.__name__,

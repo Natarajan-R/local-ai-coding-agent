@@ -14,15 +14,20 @@ _METHOD_RE = re.compile(r"[A-Za-z_][\w<>\[\], ]*\s+[A-Za-z_]\w*\s*\([^;{]*\)\s*\
 
 
 class JavaProfile(LanguageProfile):
+    """Regex-based Java profile used when tree-sitter's Java grammar is unavailable."""
+
     @property
     def name(self) -> str:
+        """Language name (``java``)."""
         return "java"
 
     @property
     def extensions(self) -> List[str]:
+        """Extensions handled by this profile (``.java``)."""
         return [".java"]
 
     def generate_skeleton(self, content: str) -> str:
+        """Return a skeleton of Java type and method declarations, bodies elided."""
         lines: List[str] = []
         for raw in content.splitlines():
             line = raw.rstrip()

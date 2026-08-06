@@ -8,15 +8,20 @@ from .languages import LanguageProfile
 
 
 class PythonProfile(LanguageProfile):
+    """Python profile that builds skeletons and symbol lists via the stdlib AST."""
+
     @property
     def name(self) -> str:
+        """Language name (``python``)."""
         return "python"
 
     @property
     def extensions(self) -> List[str]:
+        """Extensions handled by this profile (``.py``, ``.pyi``)."""
         return [".py", ".pyi"]
 
     def extract_symbols(self, content: str) -> List[Tuple[str, str, int]]:
+        """Return (name, kind, line) for each class/function/method, or [] on syntax error."""
         try:
             tree = ast.parse(content)
         except SyntaxError:
@@ -24,6 +29,7 @@ class PythonProfile(LanguageProfile):
         out: List[Tuple[str, str, int]] = []
 
         def visit(node, in_class: bool) -> None:
+            """Recurse the AST, recording defs and tracking class nesting."""
             for child in ast.iter_child_nodes(node):
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     out.append((child.name, "method" if in_class else "function", child.lineno))
@@ -38,6 +44,7 @@ class PythonProfile(LanguageProfile):
         return out
 
     def generate_skeleton(self, content: str) -> str:
+        """Return a signatures-only skeleton via the AST, falling back to a regex scan on syntax errors."""
         try:
             tree = ast.parse(content)
         except SyntaxError:
@@ -46,6 +53,7 @@ class PythonProfile(LanguageProfile):
         lines: List[str] = []
 
         def render(node: ast.AST, indent: int = 0) -> None:
+            """Emit ``def``/``class`` signature lines for a node's body, recursing into classes."""
             pad = "    " * indent
             for child in getattr(node, "body", []):
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -63,6 +71,7 @@ class PythonProfile(LanguageProfile):
 
     @staticmethod
     def _fallback(content: str) -> str:
+        """Regex fallback: keep only lines that start a def/class when the AST can't parse."""
         keep = [
             ln.rstrip()
             for ln in content.splitlines()

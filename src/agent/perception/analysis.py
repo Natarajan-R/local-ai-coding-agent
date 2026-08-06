@@ -27,6 +27,7 @@ def python_syntax_errors(source: str, filename: str = "<edit>") -> List[str]:
 
 
 def is_python_file(path: str) -> bool:
+    """Return True if ``path`` has a Python source extension (.py/.pyi)."""
     return path.lower().endswith(PYTHON_EXTENSIONS)
 
 

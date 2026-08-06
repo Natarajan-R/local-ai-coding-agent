@@ -88,3 +88,8 @@ addopts = "-q"
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately co-locate some imports with the test group they belong to,
+# under explanatory comment blocks, rather than at the top of the file.
+"tests/**" = ["E402"]

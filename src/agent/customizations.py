@@ -1,3 +1,4 @@
+"""Discovery of per-workspace skills and rules from a ``.agents`` directory."""
 from __future__ import annotations
 
 import logging
@@ -27,9 +28,11 @@ class CustomizationLoader:
     """Discovers and loads agent skills and rules from workspace customizations."""
 
     def __init__(self, workspace: Path) -> None:
+        """Store the workspace root under which customizations are searched."""
         self.workspace = Path(workspace)
 
     def _find_agents_dir(self) -> Path | None:
+        """Walk up from the workspace (max 5 levels) to find a ``.agents`` dir."""
         curr = self.workspace.resolve()
         for _ in range(5):
             agents_dir = curr / ".agents"

@@ -2,13 +2,17 @@
 
 Drive the local [AI Coding Agent](../README.md) from inside VS Code. The
 extension connects to a running `ai-agent serve` instance over its WebSocket API
-and shows a **live run dashboard** (plan, tokens, tool calls, evaluation, summary)
-in a webview, while surfacing **command approvals and "I'm stuck" hint requests as
-native VS Code dialogs**.
+and gives you a **chat panel**: each message you send is one task run, and the
+agent's plan, tool calls, evaluation and summary render as its reply. Earlier
+turns stay in the thread, so the panel is a transcript of the session.
 
-This reuses the exact server protocol described in `expert_review.md` §7 (Path B:
-agent server + webview) — the browser dashboard (`ai-agent serve`) and this
-extension are two clients of the same local WebSocket server.
+**Command approvals and "I'm stuck" hint requests** are answered either inline in
+the thread or with native VS Code dialogs — see
+[`aiAgent.promptStyle`](#settings). Only one of the two is offered for a given
+decision, so you are never asked the same thing twice.
+
+The browser dashboard (`ai-agent serve`) and this extension are two clients of
+the same local WebSocket server.
 
 ## Install (recommended)
 
@@ -48,11 +52,25 @@ Development Host — this folder ships a `.vscode/launch.json`, so F5 works with
 extra setup. (Re-run `npm run compile` after editing `src/`, since F5 runs `out/`.)
 In it:
 
-- **AI Agent: Open Dashboard** — opens the live run viewer.
+- **AI Agent: Open Chat** — opens the chat panel.
+- **AI Agent: Open Dashboard** — alias for the same panel (kept for existing keybindings).
 - **AI Agent: Run Task…** — prompts for a task and starts a run.
 
-When the agent asks to run a command, VS Code shows an **Approve / Deny** dialog.
-When it exhausts its retries, VS Code shows an **input box** to type a hint.
+In the panel: type a task and press **Enter** to send (**Shift+Enter** for a new
+line). Tool calls are collapsed by default — click one to see its full arguments
+or output. **Clear** empties the transcript; **Pause / Resume / Stop** control the
+active run.
+
+Only one run executes at a time (the server refuses a second), so the composer is
+disabled while a task is in flight.
+
+### Approvals and hints
+
+When the agent asks to run a command you get **Approve / Deny**; when it exhausts
+its retries you get a **hint box**. By default these appear *inline in the thread*
+when the panel is visible, and as *native VS Code dialogs* when it is not — so a
+run started from the command palette can still be answered with the panel closed.
+Force one or the other with `aiAgent.promptStyle`.
 
 ## Settings
 
@@ -61,6 +79,7 @@ When it exhausts its retries, VS Code shows an **input box** to type a hint.
 | `aiAgent.serverUrl` | `ws://127.0.0.1:8765` | URL of the `ai-agent serve` instance |
 | `aiAgent.token` | `""` | Session token printed by `ai-agent serve` (the `?token=…` value). Required unless the server runs with `--no-auth`; without it the WebSocket is rejected with a 403. |
 | `aiAgent.autoApprove` | `false` | Run in `--auto` mode (skip approval prompts) |
+| `aiAgent.promptStyle` | `auto` | Where approval/hint prompts are answered: `auto` (inline when the chat panel is visible, native otherwise), `inline`, or `native`. |
 
 ## Notes
 

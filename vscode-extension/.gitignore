@@ -1,6 +1,10 @@
 node_modules/
 out/
 
+# Packaged extension bundle -- rebuilt by `vsce package`, and every rebuild would
+# add another copy of the binary to history.
+*.vsix
+
 # The root .gitignore blanket-ignores .vscode/, but an extension project needs its
 # launch config committed so F5 launches the Extension Development Host out of the box.
 !.vscode/

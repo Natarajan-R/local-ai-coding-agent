@@ -32,6 +32,7 @@ _VAR_ONLY = re.compile(r"^\$\{?(\w+)\}?$")
 
 
 def _available() -> bool:
+    """Return True if the optional ``bashlex`` parser is importable."""
     try:
         import bashlex  # noqa: F401
         return True
@@ -53,10 +54,12 @@ def _walk(node):
 
 
 def _command_words(command_node) -> List[str]:
+    """Return the literal word tokens of a bashlex command node."""
     return [p.word for p in getattr(command_node, "parts", []) if getattr(p, "kind", None) == "word"]
 
 
 def _basename(word: str) -> str:
+    """Return the final path component of ``word`` (e.g. ``/bin/rm`` -> ``rm``)."""
     return os.path.basename(word)
 
 
@@ -127,6 +130,7 @@ def _inline_program(exe: str, args: List[str]) -> Optional[str]:
 
 
 def _check_words(words: List[str], unresolved: Optional[List[bool]] = None) -> Optional[str]:
+    """Return a block reason if a single command's words are destructive, else None."""
     if not words:
         return None
     unresolved = unresolved or [False] * len(words)
@@ -196,6 +200,7 @@ def _check_words(words: List[str], unresolved: Optional[List[bool]] = None) -> O
 
 
 def _pipeline_exes(pipeline_node) -> List[str]:
+    """Return the executable basenames of each command in a pipeline."""
     exes: List[str] = []
     for part in getattr(pipeline_node, "parts", []):
         if getattr(part, "kind", None) == "command":

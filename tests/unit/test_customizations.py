@@ -1,5 +1,3 @@
-import pytest
-from pathlib import Path
 from agent.customizations import CustomizationLoader, parse_frontmatter
 
 

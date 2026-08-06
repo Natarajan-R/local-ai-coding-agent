@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class LangSpec:
+    """Config for one tree-sitter grammar: its module, extensions and node types."""
+
     module: str                     # grammar module name, e.g. "tree_sitter_java"
     extensions: List[str]
     containers: Set[str]            # node types to render as "class { ... }"
@@ -131,6 +133,7 @@ class TreeSitterProfile(LanguageProfile):
         containers: Set[str],
         members: Set[str],
     ) -> None:
+        """Bind a compiled parser plus the container/member node types to render."""
         self._name = name
         self._extensions = extensions
         self._parser = parser
@@ -139,13 +142,16 @@ class TreeSitterProfile(LanguageProfile):
 
     @property
     def name(self) -> str:
+        """Language name for this profile."""
         return self._name
 
     @property
     def extensions(self) -> List[str]:
+        """File extensions this profile handles."""
         return self._extensions
 
     def generate_skeleton(self, content: str) -> str:
+        """Parse ``content`` and render a container/member signature skeleton (empty on parse failure)."""
         try:
             tree = self._parser.parse(bytes(content, "utf-8"))
         except Exception as exc:  # pragma: no cover - defensive
@@ -156,6 +162,7 @@ class TreeSitterProfile(LanguageProfile):
         return "\n".join(lines)
 
     def _walk(self, node, depth: int, lines: List[str]) -> None:
+        """Recurse the parse tree, emitting indented headers for containers and members."""
         next_depth = depth
         # Guard on is_named: anonymous keyword tokens can share a node-type name
         # with real nodes (e.g. Ruby's `class`/`module` keyword vs. class node).
@@ -169,6 +176,7 @@ class TreeSitterProfile(LanguageProfile):
 
     @staticmethod
     def _decode(node) -> str:
+        """Decode a node's source bytes to text (empty string if it has none)."""
         return node.text.decode("utf-8", "replace") if node.text else ""
 
     @staticmethod
@@ -181,12 +189,14 @@ class TreeSitterProfile(LanguageProfile):
 
     @classmethod
     def _container_header(cls, node) -> str:
+        """Render a container declaration (class/struct/...) as ``signature { ... }``."""
         text = cls._decode(node)
         head = cls._segment(text)
         return head + (" { ... }" if "{" in text else "")
 
     @classmethod
     def _member_header(cls, node) -> str:
+        """Render a member declaration (method/function) as its signature line."""
         text = cls._decode(node)
         return cls._segment(text).rstrip(";").rstrip()
 
@@ -199,6 +209,7 @@ class TreeSitterProfile(LanguageProfile):
 
     @classmethod
     def _node_name(cls, node) -> Optional[str]:
+        """Return a declaration's identifier, preferring primary name node types."""
         for child in node.children:
             if child.is_named and child.type in cls._PRIMARY_NAME_TYPES:
                 return cls._decode(child)
@@ -209,12 +220,14 @@ class TreeSitterProfile(LanguageProfile):
 
     @staticmethod
     def _kind(node_type: str) -> str:
+        """Normalise a tree-sitter node type into a short symbol kind (e.g. ``class``)."""
         kind = node_type
         for suffix in ("_declaration", "_definition", "_specifier", "_statement", "_item", "_spec"):
             kind = kind.replace(suffix, "")
         return kind
 
     def extract_symbols(self, content: str) -> List[tuple]:
+        """Return (name, kind, line) for each container/member declaration in ``content``."""
         try:
             tree = self._parser.parse(bytes(content, "utf-8"))
         except Exception:  # pragma: no cover - defensive
@@ -222,6 +235,7 @@ class TreeSitterProfile(LanguageProfile):
         out: List[tuple] = []
 
         def walk(node) -> None:
+            """Recurse the tree, collecting named container/member symbols."""
             if node.is_named and (node.type in self._containers or node.type in self._members):
                 name = self._node_name(node)
                 if name:
@@ -249,6 +263,7 @@ def build_profiles(languages: Optional[List[str]] = None) -> List[TreeSitterProf
 
 
 def treesitter_available() -> bool:
+    """Return True if the optional ``tree_sitter`` runtime is importable."""
     try:
         import tree_sitter  # noqa: F401
         return True

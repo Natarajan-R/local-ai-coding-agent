@@ -9,11 +9,21 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ..utils.circuit_breaker import CircuitBreaker, CircuitOpenError
+
 logger = logging.getLogger(__name__)
 
 # Bound LSP request/handshake waits so a missing or wedged server can never hang
 # the agent's execution loop.
 REQUEST_TIMEOUT = 15.0
+
+# A per-request timeout bounds one call, but nothing remembers that the last five
+# calls all timed out -- so a wedged server keeps costing REQUEST_TIMEOUT seconds
+# on every query for the rest of the run. These trip a breaker after a few
+# consecutive failures so subsequent calls fail fast and the agent falls back to
+# its non-semantic tools, with a periodic probe in case the server recovers.
+LSP_FAILURE_THRESHOLD = 3
+LSP_RECOVERY_TIMEOUT = 60
 
 
 class LSPClient:
@@ -21,6 +31,7 @@ class LSPClient:
 
     @staticmethod
     def _resolve_cmd(workspace_dir: Path) -> List[str]:
+        """Return the default pylsp launch command, preferring the active venv."""
         # Prefer a pylsp next to the running interpreter, then a workspace venv,
         # then whatever is on PATH.
         active = Path(sys.executable).parent / "pylsp"
@@ -62,6 +73,7 @@ class LSPClient:
         return shutil.which(exe) is not None
 
     def __init__(self, workspace_dir: Path, cmd: Optional[List[str]] = None) -> None:
+        """Resolve the server command and set up request/diagnostic bookkeeping (no process yet)."""
         self.workspace_dir = Path(workspace_dir).resolve()
         base = cmd if cmd is not None else self._resolve_cmd(self.workspace_dir)
         self.cmd = self.resolve_command(self.workspace_dir, base)
@@ -76,9 +88,16 @@ class LSPClient:
         self._pending_uris: set = set()
         self._ready = asyncio.Event()
         self._running = False
+        # One breaker per server process: a wedged pylsp must not disable gopls.
+        self.breaker = CircuitBreaker(
+            failure_threshold=LSP_FAILURE_THRESHOLD,
+            recovery_timeout=LSP_RECOVERY_TIMEOUT,
+            name=f"lsp:{Path(self.cmd[0]).name}",
+        )
 
     @property
     def running(self) -> bool:
+        """True while the server process is live and initialized."""
         return self._running
 
     async def start(self) -> None:
@@ -127,6 +146,17 @@ class LSPClient:
     async def _send_request(
         self, method: str, params: Dict[str, Any], timeout: float = REQUEST_TIMEOUT
     ) -> Any:
+        """Send a JSON-RPC request through the circuit breaker, bounded by ``timeout``.
+
+        Raises :class:`CircuitOpenError` immediately (without touching the server)
+        once repeated failures have tripped the breaker.
+        """
+        return await self.breaker.call(self._send_request_raw, method, params, timeout)
+
+    async def _send_request_raw(
+        self, method: str, params: Dict[str, Any], timeout: float = REQUEST_TIMEOUT
+    ) -> Any:
+        """Send a JSON-RPC request and await its response, bounded by ``timeout``."""
         if not self._proc or not self._proc.stdin:
             raise RuntimeError("LSP server not running")
         self._id_counter += 1
@@ -156,6 +186,7 @@ class LSPClient:
             self._pending_requests.pop(req_id, None)
 
     async def send_notification(self, method: str, params: Dict[str, Any]) -> None:
+        """Send a fire-and-forget JSON-RPC notification (no response awaited)."""
         if not self._proc or not self._proc.stdin:
             raise RuntimeError("LSP server not running")
         payload = {
@@ -170,6 +201,7 @@ class LSPClient:
         await self._proc.stdin.drain()
 
     async def _initialize(self) -> None:
+        """Perform the LSP initialize/initialized handshake and mark the client ready."""
         params = {
             "processId": None,
             "rootUri": self.workspace_dir.as_uri(),
@@ -203,6 +235,7 @@ class LSPClient:
             return False
 
     async def _read_loop(self) -> None:
+        """Background task: read framed JSON-RPC messages and dispatch responses/diagnostics."""
         try:
             while self._proc and self._proc.stdout:
                 # Parse headers
@@ -283,6 +316,10 @@ class LSPClient:
         for code the server has not looked at yet. A diagnostics tool that races is worse
         than none: it answers "no errors" when it means "don't know yet".
         """
+        # A wedged server never pushes diagnostics, so without this the poll below
+        # burns the full timeout on every single call.
+        if self._degraded("diagnostics"):
+            return False
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while self._pending_uris - set(self.diagnostics):
@@ -311,10 +348,23 @@ class LSPClient:
         }
         await self.send_notification("textDocument/didChange", params)
 
+    def _degraded(self, operation: str) -> bool:
+        """True if the breaker is open, so ``operation`` should fail fast.
+
+        Checked *before* the readiness wait so a tripped breaker costs nothing at all
+        rather than the bounded-but-real waits each query would otherwise pay.
+        """
+        if self.breaker.is_open:
+            logger.debug(
+                "Skipping LSP %s: breaker '%s' is open", operation, self.breaker.name
+            )
+            return True
+        return False
+
     # Semantic Query Operations
     async def get_definition(self, path: Path, line: int, character: int) -> List[Dict[str, Any]]:
         """Query definition locations (0-indexed line and character)."""
-        if not await self._wait_ready():
+        if self._degraded("definition") or not await self._wait_ready():
             return []
         uri = Path(path).resolve().as_uri()
         params = {
@@ -325,6 +375,8 @@ class LSPClient:
             res = await asyncio.wait_for(
                 self._send_request("textDocument/definition", params), timeout=REQUEST_TIMEOUT
             )
+        except CircuitOpenError:
+            return []  # breaker tripped mid-flight; already logged when it opened
         except Exception as exc:
             logger.warning("LSP definition request failed: %s", exc)
             return []
@@ -336,7 +388,7 @@ class LSPClient:
 
     async def get_references(self, path: Path, line: int, character: int) -> List[Dict[str, Any]]:
         """Query reference locations (0-indexed line and character)."""
-        if not await self._wait_ready():
+        if self._degraded("references") or not await self._wait_ready():
             return []
         uri = Path(path).resolve().as_uri()
         params = {
@@ -348,6 +400,8 @@ class LSPClient:
             res = await asyncio.wait_for(
                 self._send_request("textDocument/references", params), timeout=REQUEST_TIMEOUT
             )
+        except CircuitOpenError:
+            return []  # breaker tripped mid-flight; already logged when it opened
         except Exception as exc:
             logger.warning("LSP references request failed: %s", exc)
             return []
@@ -355,7 +409,7 @@ class LSPClient:
 
     async def rename(self, path: Path, line: int, character: int, new_name: str) -> Optional[Dict[str, Any]]:
         """Query rename edits for a symbol (0-indexed line and character)."""
-        if not await self._wait_ready():
+        if self._degraded("rename") or not await self._wait_ready():
             return None
         uri = Path(path).resolve().as_uri()
         params = {
@@ -367,6 +421,8 @@ class LSPClient:
             return await asyncio.wait_for(
                 self._send_request("textDocument/rename", params), timeout=REQUEST_TIMEOUT
             )
+        except CircuitOpenError:
+            return None  # breaker tripped mid-flight; already logged when it opened
         except Exception as exc:
             logger.warning("LSP rename request failed: %s", exc)
             return None
@@ -418,6 +474,7 @@ _LSP_SERVERS = [
 
 
 def _default_ext_map() -> Dict[str, tuple]:
+    """Build the extension -> (server command, language id) routing table."""
     ext_map: Dict[str, tuple] = {}
     for cmd, language_id, extensions in _LSP_SERVERS:
         for ext in extensions:
@@ -434,12 +491,18 @@ class LSPManager:
     """
 
     def __init__(self, workspace_dir: Path, ext_map: Optional[Dict[str, tuple]] = None) -> None:
+        """Set up per-language client pooling for ``workspace_dir`` (clients start lazily)."""
         self.workspace_dir = Path(workspace_dir).resolve()
         self._ext_map = ext_map or _default_ext_map()
         self._clients: Dict[tuple, LSPClient] = {}
+        # A client that fails to start is never pooled, so without a breaker here a
+        # server that hangs its handshake gets re-spawned -- and re-waited -- on every
+        # single query. Keyed by command so each server is judged separately.
+        self._start_breakers: Dict[tuple, CircuitBreaker] = {}
 
     @classmethod
     def is_available(cls, workspace_dir: Path, ext_map: Optional[Dict[str, tuple]] = None) -> bool:
+        """Return True if at least one configured language server binary can be found."""
         ext_map = ext_map or _default_ext_map()
         checked: set = set()
         for cmd, _lang in ext_map.values():
@@ -451,9 +514,21 @@ class LSPManager:
         return False
 
     def _spec_for(self, path) -> Optional[tuple]:
+        """Return the (command, language id) spec for a file's extension, or None."""
         return self._ext_map.get(Path(path).suffix.lower())
 
+    def _start_breaker(self, cmd: tuple) -> CircuitBreaker:
+        """Return (creating on first use) the breaker guarding start-up for one server."""
+        if cmd not in self._start_breakers:
+            self._start_breakers[cmd] = CircuitBreaker(
+                failure_threshold=LSP_FAILURE_THRESHOLD,
+                recovery_timeout=LSP_RECOVERY_TIMEOUT,
+                name=f"lsp-start:{Path(cmd[0]).name}",
+            )
+        return self._start_breakers[cmd]
+
     async def _client_for(self, path):
+        """Return (client, language id) for a file, lazily starting the server if needed."""
         spec = self._spec_for(path)
         if spec is None:
             return None, None
@@ -462,9 +537,15 @@ class LSPManager:
             return self._clients[cmd], language_id
         if not LSPClient.is_available(self.workspace_dir, list(cmd)):
             return None, language_id
+        breaker = self._start_breaker(cmd)
+        if breaker.is_open:
+            logger.debug("Skipping LSP start for %s: breaker '%s' is open", cmd, breaker.name)
+            return None, language_id
         client = LSPClient(self.workspace_dir, cmd=list(cmd))
         try:
-            await client.start()
+            await breaker.call(client.start)
+        except CircuitOpenError:  # pragma: no cover - raced the is_open check above
+            return None, language_id
         except Exception as exc:  # pragma: no cover - depends on server binary
             logger.warning("Failed to start LSP server %s: %s", cmd, exc)
             return None, language_id
@@ -472,10 +553,12 @@ class LSPManager:
         return client, language_id
 
     async def start(self) -> None:
+        """No-op: per-language servers are started lazily on first use."""
         # Servers start lazily per language; nothing to do up front.
         return None
 
     async def stop(self) -> None:
+        """Stop every pooled language-server client (best effort)."""
         for client in list(self._clients.values()):
             try:
                 await client.stop()
@@ -484,24 +567,29 @@ class LSPManager:
         self._clients.clear()
 
     async def open_document(self, path: Path, content: str) -> None:
+        """Open a document on the server for its language (no-op if unsupported)."""
         client, language_id = await self._client_for(path)
         if client is not None:
             await client.open_document(path, content, language_id=language_id or "plaintext")
 
     async def change_document(self, path: Path, content: str) -> None:
+        """Notify the server that a document's contents changed."""
         client, _ = await self._client_for(path)
         if client is not None:
             await client.change_document(path, content)
 
     async def get_definition(self, path: Path, line: int, character: int) -> List[Dict[str, Any]]:
+        """Return the definition location(s) for the symbol at a position (empty if unsupported)."""
         client, _ = await self._client_for(path)
         return await client.get_definition(path, line, character) if client is not None else []
 
     async def get_references(self, path: Path, line: int, character: int) -> List[Dict[str, Any]]:
+        """Return all reference locations for the symbol at a position (empty if unsupported)."""
         client, _ = await self._client_for(path)
         return await client.get_references(path, line, character) if client is not None else []
 
     async def rename(self, path: Path, line: int, character: int, new_name: str) -> Optional[Dict[str, Any]]:
+        """Request a workspace-wide rename edit for the symbol at a position."""
         client, _ = await self._client_for(path)
         if client is not None:
             return await client.rename(path, line, character, new_name)
@@ -513,6 +601,7 @@ class LSPManager:
         return all(results)
 
     def get_all_diagnostics(self) -> str:
+        """Aggregate the current diagnostics from every pooled server into one report."""
         parts = []
         for client in self._clients.values():
             text = client.get_all_diagnostics()

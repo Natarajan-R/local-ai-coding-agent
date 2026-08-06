@@ -22,6 +22,8 @@ MAX_INDEX_FILES = 5000
 
 @dataclass
 class SymbolHit:
+    """A single symbol match: its name, kind, file path and 1-indexed line."""
+
     name: str
     kind: str
     path: str
@@ -53,11 +55,13 @@ class SymbolIndex:
     """Lazily-built SQLite index of symbols and imports for a workspace."""
 
     def __init__(self, indexer) -> None:
+        """Bind to a workspace indexer; the SQLite index is built lazily on first query."""
         self.indexer = indexer
         self._conn: sqlite3.Connection | None = None
 
     # -- build ---------------------------------------------------------------
     def _build(self) -> sqlite3.Connection:
+        """Scan every supported file and populate an in-memory symbols/imports database."""
         conn = sqlite3.connect(":memory:")
         conn.execute("CREATE TABLE symbols (name TEXT, kind TEXT, path TEXT, line INTEGER)")
         conn.execute("CREATE TABLE imports (module TEXT, path TEXT, line INTEGER)")
@@ -91,6 +95,7 @@ class SymbolIndex:
         return conn
 
     def _ensure(self) -> sqlite3.Connection:
+        """Return the DB connection, building the index on first access."""
         if self._conn is None:
             self._conn = self._build()
         return self._conn
@@ -103,6 +108,7 @@ class SymbolIndex:
 
     # -- queries -------------------------------------------------------------
     def find_definition(self, name: str, limit: int = 50) -> List[SymbolHit]:
+        """Return symbols whose name exactly matches ``name``."""
         conn = self._ensure()
         rows = conn.execute(
             "SELECT name, kind, path, line FROM symbols WHERE name = ? "
@@ -112,6 +118,7 @@ class SymbolIndex:
         return [SymbolHit(*r) for r in rows]
 
     def search(self, pattern: str, limit: int = 50) -> List[SymbolHit]:
+        """Return symbols whose name contains ``pattern`` (substring match)."""
         conn = self._ensure()
         rows = conn.execute(
             "SELECT name, kind, path, line FROM symbols WHERE name LIKE ? "
@@ -121,6 +128,7 @@ class SymbolIndex:
         return [SymbolHit(*r) for r in rows]
 
     def importers(self, name: str, limit: int = 50) -> List[Tuple[str, int, str]]:
+        """Return (path, line, module) for files importing ``name`` or a submodule of it."""
         conn = self._ensure()
         rows = conn.execute(
             "SELECT DISTINCT path, line, module FROM imports "
@@ -131,6 +139,7 @@ class SymbolIndex:
         return [(r[0], r[1], r[2]) for r in rows]
 
     def stats(self) -> dict:
+        """Return the number of indexed symbols and imports."""
         conn = self._ensure()
         n_sym = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
         n_imp = conn.execute("SELECT COUNT(*) FROM imports").fetchone()[0]

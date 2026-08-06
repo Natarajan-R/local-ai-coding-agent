@@ -157,7 +157,7 @@ def test_condense_falls_back_for_non_pytest_output():
 # evidence and you see only vague reflexions and unexplained failures -- so the
 # shapes it must handle are pinned here.
 
-from agent.evaluation.evaluator import _extract_failures, _condense_test_output
+from agent.evaluation.evaluator import _extract_failures
 
 
 PYTEST_FAILURE = """============================= test session starts ==============================
