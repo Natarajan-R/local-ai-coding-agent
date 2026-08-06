@@ -202,9 +202,9 @@ Each one is a hands-on build with its code in the open.
 
 | Book | Amazon | Code |
 |---|---|---|
-| **Enterprise AI Workflow Automation: Building Resilient Agentic Systems** | [US](https://www.amazon.com/dp/B0HCZC7VCC) · [IN](https://www.amazon.in/dp/B0HCZC7VCC) | [auto-sre-graph](https://github.com/Natarajan-R/auto-sre-graph) |
+| **Enterprise AI Workflow Automation** | [US](https://www.amazon.com/dp/B0HCZC7VCC) · [IN](https://www.amazon.in/dp/B0HCZC7VCC) | [auto-sre-graph](https://github.com/Natarajan-R/auto-sre-graph) |
 | **Agentic AI — A Hands-On Guide** | [US](https://www.amazon.com/dp/B0H6R7SZZB) · [IN](https://www.amazon.in/dp/B0H6R7SZZB) | [agentic-ai-book](https://github.com/Natarajan-R/agentic-ai-book) |
-| **GraphRAG: Building an Intelligent Research Assistant with Knowledge Graphs** | [US](https://www.amazon.com/dp/B0H3QXVSY4) · [IN](https://www.amazon.in/dp/B0H3QXVSY4) | [graphrag-book-code](https://github.com/Natarajan-R/graphrag-book-code) |
+| **GraphRAG: Building an Intelligent Research Assistant** | [US](https://www.amazon.com/dp/B0H3QXVSY4) · [IN](https://www.amazon.in/dp/B0H3QXVSY4) | [graphrag-book-code](https://github.com/Natarajan-R/graphrag-book-code) |
 
 All titles → [Amazon author page](https://www.amazon.com/stores/author/B0H3T2MG83)
 
