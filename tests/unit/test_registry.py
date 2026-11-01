@@ -440,3 +440,29 @@ def test_safe_unescape_converts_structural_tab_indent():
     out = _safe_unescape("def f():\\n\\tif x:\\n\\t\\treturn 1")
     _ast.parse(out)
     assert "\tif x:" in out and "\t\treturn 1" in out
+
+
+# --- P2 regression: required-argument validation before dispatch -------------
+
+async def test_write_file_missing_path_returns_structured_error(registry):
+    """write_file без path → структурированная ошибка, а не сырой TypeError."""
+    import json
+    res = await registry.execute("write_file", {"content": "print(1)"})
+    assert not res.ok
+    payload = json.loads(res.content)  # валидный JSON, а не текст TypeError
+    assert payload["error"] == "missing_required_arguments"
+    assert payload["tool"] == "write_file"
+    assert payload["missing"] == ["path"]
+    assert "content" in payload["provided"]
+    assert "path" in payload["expected_schema"]
+    assert "path" in payload["hint"]
+    assert "TypeError" not in res.content
+
+
+async def test_write_file_valid_call_still_succeeds(registry, workspace):
+    """Корректный вызов с всеми обязательными аргументами проходит валидацию и пишет файл."""
+    res = await registry.execute(
+        "write_file", {"path": "storage.py", "content": "x = 42\n"}
+    )
+    assert res.ok
+    assert (workspace / "storage.py").read_text() == "x = 42\n"

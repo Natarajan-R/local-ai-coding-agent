@@ -81,6 +81,22 @@ class EvaluatorValidator:
                 ),
             )
         
+        # Rule 3 (P4): a required planner/editor subtask failed to complete.
+        # Do not let a passing evaluator mask that into a false success.
+        if result.passed:
+            failures = self.orch.frame.metadata.get("subtask_failures") or []
+            if failures:
+                paths = ", ".join(str(f.get("path")) for f in failures)
+                return replace(
+                    result,
+                    passed=False,
+                    summary=(
+                        f"Tests pass, but {len(failures)} required subtask(s) did not "
+                        f"complete their edit: {paths}. Finish these changes before "
+                        "the task can be considered done."
+                    ),
+                )
+
         return result
 
 
@@ -294,7 +310,18 @@ class ReviewerAgent:
     def __init__(self, orchestrator):
         self.orch = orchestrator
         self._context = EvaluationContext()
-        
+
+        # P4 invariant: the only EVALUATING --passed--> DONE edge is taken in
+        # execute_evaluation(), which runs every result through
+        # EvaluatorValidator (Rule 3 flips green evals to failed when
+        # subtask_failures is non-empty). So a failed required subtask cannot
+        # reach DONE nor the cli/main.py "Success" panel — including after
+        # retries are exhausted: _handle_exhausted_budget() either escalates
+        # and retries or _give_up() -> ERROR, never DONE.
+        # (A former FSM register_callback guard was removed here: the real
+        # FSM in src/agent/fsm.py exposes no register_callback API, so it
+        # raised AttributeError in every ReviewerAgent construction.)
+
         # Initialize components
         self._validator = EvaluatorValidator(orchestrator)
         self._reflexion_engine = ReflexionCoordinator(orchestrator)

@@ -325,6 +325,10 @@ class Orchestrator:
     async def run_task(self, task: str, stream: bool = True) -> AgentFrame:
         """Run one task end to end through the FSM and return the final frame."""
         self.frame.task_description = task
+        # P3: per-task reset of tool state (overwrite counters).  The registry
+        # lives as long as the orchestrator, so sequential tasks must not share
+        # counters; retries/reflexion within THIS task do not call this.
+        self.tools.begin_task()
         self.runtime.stream = stream
         self.log.info("Task start: %s", task)
         self.audit.record("task_start", task=task, model=self.model_name,

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -62,6 +63,12 @@ class ToolRegistry:
 
         self._mutation_lock = asyncio.Lock()
         self._edit_misses: Dict[str, int] = {}
+        # P3: task-scoped repeated-overwrite tracking for write_file.
+        # Keyed by normalized workspace-relative path -> number of *executed*
+        # writes to that path within the current task.  Survives retries /
+        # reflexion because the orchestrator keeps one ToolRegistry per run;
+        # see begin_task() for the per-task reset.
+        self._write_counts: Dict[str, int] = {}
         self.tools: Dict[str, Tool] = {}
 
         self._register_core_tools()
@@ -521,19 +528,140 @@ class ToolRegistry:
     def get_descriptions(self) -> List[Dict[str, Any]]:
         return [t.schema() for t in self.tools.values()]
 
+    # -- P3: repeated-overwrite (thrash) guard -------------------------------
+
+    WRITE_OVERWRITE_LIMIT = 3  # max executed write_file calls per normalized path per task
+
+    def begin_task(self) -> None:
+        """Clear per-task tool state.  Call once when a new task starts.
+
+        The orchestrator keeps one ToolRegistry for its whole lifetime, so
+        without this the P3 overwrite counters would leak across sequential
+        tasks in a long-lived process.  Retries/reflexion within the same
+        task must NOT call this — the counters have to survive them.
+        """
+        self._write_counts.clear()
+        self._edit_misses.clear()
+
+    def _normalized_write_key(self, path: str) -> Optional[str]:
+        """Workspace-relative normalized posix path used as the counter key.
+
+        './x', 'a/../x' and 'x' all collapse to the same key.  Returns None
+        for paths that escape the workspace — those are left to the existing
+        policy validation inside the handler (behavior unchanged).
+        """
+        from ..guardrails.paths import is_safe_path
+        try:
+            if not is_safe_path(self.workspace, path):
+                return None
+            resolved = self.policy.resolve_path(path)
+            return resolved.relative_to(self.workspace).as_posix()
+        except (ValueError, OSError):
+            return None
+
+    def _check_write_overwrite_guard(self, args: Dict[str, Any]) -> Optional[ToolResult]:
+        """Return a structured error if this write_file call would exceed the
+        per-path overwrite limit; None if the call may proceed.
+
+        Called BEFORE dispatch, so the blocked write never reaches the writer.
+        """
+        path = args.get("path")
+        if not isinstance(path, str) or not path:
+            return None  # missing/invalid path -> P2 required-args error handles it
+        key = self._normalized_write_key(path)
+        if key is None:
+            return None
+        if self._write_counts.get(key, 0) >= self.WRITE_OVERWRITE_LIMIT:
+            payload = json.dumps(
+                {
+                    "error": "repeated_overwrite_blocked",
+                    "tool": "write_file",
+                    "path": key,
+                    "prior_writes": self._write_counts[key],
+                    "limit": self.WRITE_OVERWRITE_LIMIT,
+                    "hint": (
+                        f"'{key}' was already fully overwritten {self._write_counts[key]} "
+                        f"times in this task; further full-file overwrites are blocked. "
+                        "Do NOT retry write_file on this path. Use read_file to inspect "
+                        "the current content, then apply a targeted change with "
+                        "search_replace or edit_lines."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+            return ToolResult(False, payload)
+        return None
+
+    @staticmethod
+    def _validate_required_args(tool: Tool, args: Dict[str, Any]) -> List[str]:
+        """Return names of required parameters (per the tool's own JSON schema)
+        that are missing from *args*.  Structural validation only — no type checks.
+        """
+        params = tool.parameters or {}
+        required = params.get("required") or []
+        props = params.get("properties") or {}
+        missing = []
+        for name in required:
+            # Optional-by-default (has a schema-level default) → not an error if absent.
+            if name in props and isinstance(props[name], dict) and "default" in props[name]:
+                continue
+            if args.get(name) is None:
+                missing.append(name)
+        return missing
+
     async def execute(self, tool_name: str, args: Dict[str, Any]) -> ToolResult:
         logger.debug("Executing tool %s args=%s", tool_name, args)
         tool = self.tools.get(tool_name)
         if tool is None:
             return ToolResult(False, f"Unknown tool: {tool_name}")
+        missing = self._validate_required_args(tool, args or {})
+        if missing:
+            props = (tool.parameters or {}).get("properties") or {}
+            expected = {
+                k: v.get("type", "string") if isinstance(v, dict) else "any"
+                for k, v in props.items()
+            }
+            payload = json.dumps(
+                {
+                    "error": "missing_required_arguments",
+                    "tool": tool_name,
+                    "missing": missing,
+                    "provided": sorted((args or {}).keys()),
+                    "expected_schema": expected,
+                    "hint": (
+                        f"Call {tool_name} again including all required "
+                        f"argument(s): {', '.join(missing)}."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+            return ToolResult(False, payload)
+        if tool_name == "write_file":
+            # P3: block a repeated full-file overwrite BEFORE dispatch so the
+            # writer never runs.  Runs after P2 required-args validation.
+            blocked = self._check_write_overwrite_guard(args or {})
+            if blocked is not None:
+                return blocked
         try:
             if tool.needs_ctx:
                 kwargs = {"ctx": self._ctx(), **(args or {})}
             else:
                 kwargs = args or {}
             if inspect.iscoroutinefunction(tool.handler):
-                return await tool.handler(**kwargs)
-            return tool.handler(**kwargs)
+                result = await tool.handler(**kwargs)
+            else:
+                result = tool.handler(**kwargs)
+            if (
+                tool_name == "write_file"
+                and isinstance(result, ToolResult)
+                and result.ok
+            ):
+                # Count only executed writes; failed ones (protected path,
+                # empty-content refusal, etc.) do not consume the budget.
+                key = self._normalized_write_key((args or {}).get("path", ""))
+                if key is not None:
+                    self._write_counts[key] = self._write_counts.get(key, 0) + 1
+            return result
         except ToolError as exc:
             return ToolResult(False, f"Error: {exc}")
         except TypeError as exc:

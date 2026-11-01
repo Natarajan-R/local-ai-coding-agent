@@ -77,6 +77,13 @@ class CoderAgent:
 
         reflexion_lesson = self.orch.frame.reflections[-1] if self.orch.frame.reflections else ""
 
+        # P4: subtask_failures must describe the *current* execution attempt.
+        # The frame survives REFLEXING --retry--> EXECUTING, so stale failures
+        # from a previous attempt would keep flipping green evaluations to
+        # failed forever (false failure). Clear at the start of each attempt;
+        # append-only semantics below stay unchanged.
+        self.orch.frame.metadata["subtask_failures"] = []
+
         for idx, item in enumerate(checklist):
             await self._check_stop_or_pause()
 
@@ -105,6 +112,16 @@ class CoderAgent:
 
             self.orch.log.info("Finished task %d/%d for %s: success=%s", idx + 1, len(checklist), path, success)
             self.orch.emit("tool_result", step=idx + 1, tool=f"editor:{path}", ok=success, content=f"Subtask completed for {path}")
+
+            if not success:
+                # P4: record failed required subtasks so evaluation/CLI cannot
+                # report a false success when the evaluator passes anyway.
+                failures = self.orch.frame.metadata.setdefault("subtask_failures", [])
+                failures.append({
+                    "index": idx,
+                    "path": path,
+                    "change_description": change_description,
+                })
 
         await self._transition_to_done()
 
